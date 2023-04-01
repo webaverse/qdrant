@@ -47,6 +47,8 @@ pub async fn handle_existing_collections(
                 hnsw_config: Some(collection_state.config.hnsw_config.into()),
                 wal_config: Some(collection_state.config.wal_config.into()),
                 optimizers_config: Some(collection_state.config.optimizer_config.into()),
+                init_from: None,
+                quantization_config: collection_state.config.quantization_config,
             },
         );
 
@@ -79,6 +81,7 @@ pub async fn handle_existing_collections(
                             shard_id,
                             peer_id: this_peer_id,
                             state: ReplicaState::Active,
+                            from_state: None,
                         }),
                         None,
                     )

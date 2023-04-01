@@ -14,11 +14,11 @@ pub fn collection_into_actix_error(err: CollectionError) -> Error {
 
 pub fn storage_into_actix_error(err: StorageError) -> Error {
     match err {
-        StorageError::BadInput { .. } => error::ErrorBadRequest(format!("{}", err)),
-        StorageError::NotFound { .. } => error::ErrorNotFound(format!("{}", err)),
-        StorageError::ServiceError { .. } => error::ErrorInternalServerError(format!("{}", err)),
-        StorageError::BadRequest { .. } => error::ErrorBadRequest(format!("{}", err)),
-        StorageError::Locked { .. } => error::ErrorForbidden(format!("{}", err)),
+        StorageError::BadInput { .. } => error::ErrorBadRequest(format!("{err}")),
+        StorageError::NotFound { .. } => error::ErrorNotFound(format!("{err}")),
+        StorageError::ServiceError { .. } => error::ErrorInternalServerError(format!("{err}")),
+        StorageError::BadRequest { .. } => error::ErrorBadRequest(format!("{err}")),
+        StorageError::Locked { .. } => error::ErrorForbidden(format!("{err}")),
     }
 }
 
@@ -33,13 +33,19 @@ where
             time: timing.elapsed().as_secs_f64(),
         }),
         Err(err) => {
-            let error_description = format!("{}", err);
+            let error_description = format!("{err}");
 
             let mut resp = match err {
                 StorageError::BadInput { .. } => HttpResponse::BadRequest(),
                 StorageError::NotFound { .. } => HttpResponse::NotFound(),
-                StorageError::ServiceError { .. } => {
-                    log::warn!("error processing request: {}", err);
+                StorageError::ServiceError {
+                    description,
+                    backtrace,
+                } => {
+                    log::warn!("error processing request: {}", description);
+                    if let Some(backtrace) = backtrace {
+                        log::trace!("backtrace: {}", backtrace);
+                    }
                     HttpResponse::InternalServerError()
                 }
                 StorageError::BadRequest { .. } => HttpResponse::BadRequest(),

@@ -1,3 +1,4 @@
+use std::cmp::max;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
@@ -8,6 +9,7 @@ use atomic_refcell::AtomicRefCell;
 use parking_lot::{Mutex, RwLock};
 use rocksdb::DB;
 use tar::Builder;
+use uuid::Uuid;
 
 use crate::common::file_operations::{atomic_save_json, read_json};
 use crate::common::version::{StorageVersion, VERSION_FILE};
@@ -21,7 +23,7 @@ use crate::entry::entry_point::{
 use crate::id_tracker::IdTrackerSS;
 use crate::index::field_index::CardinalityEstimation;
 use crate::index::struct_payload_index::StructPayloadIndex;
-use crate::index::{PayloadIndex, VectorIndexSS};
+use crate::index::{PayloadIndex, VectorIndex, VectorIndexEnum};
 use crate::spaces::tools::peek_top_smallest_iterable;
 use crate::telemetry::SegmentTelemetry;
 use crate::types::{
@@ -30,7 +32,7 @@ use crate::types::{
     SegmentInfo, SegmentState, SegmentType, SeqNumberType, WithPayload, WithVector,
 };
 use crate::utils;
-use crate::vector_storage::{ScoredPointOffset, VectorStorageSS};
+use crate::vector_storage::{ScoredPointOffset, VectorStorage, VectorStorageEnum};
 
 pub const SEGMENT_STATE_FILE: &str = "segment.json";
 
@@ -79,8 +81,8 @@ pub struct Segment {
 }
 
 pub struct VectorData {
-    pub vector_index: Arc<AtomicRefCell<VectorIndexSS>>,
-    pub vector_storage: Arc<AtomicRefCell<VectorStorageSS>>,
+    pub vector_index: Arc<AtomicRefCell<VectorIndexEnum>>,
+    pub vector_storage: Arc<AtomicRefCell<VectorStorageEnum>>,
 }
 
 impl Segment {
@@ -95,10 +97,9 @@ impl Segment {
         check_vectors_set(&vectors, &self.segment_config)?;
         for (vector_name, vector) in vectors {
             let vector_name: &str = &vector_name;
-            let vector = vector.into_owned();
             let vector_data = &self.vector_data[vector_name];
             let mut vector_storage = vector_data.vector_storage.borrow_mut();
-            vector_storage.insert_vector(internal_id, vector)?;
+            vector_storage.insert_vector(internal_id, &vector)?;
         }
         Ok(())
     }
@@ -138,8 +139,7 @@ impl Segment {
             // fail if newer operation is attempted before proper recovery
             if *failed_version < op_num {
                 return Err(OperationError::service_error(format!(
-                    "Not recovered from previous error: {}",
-                    error
+                    "Not recovered from previous error: {error}"
                 )));
             } // else: Re-try operation
         }
@@ -217,7 +217,7 @@ impl Segment {
         let res = operation(self);
 
         if res.is_ok() {
-            self.version = op_num;
+            self.version = max(op_num, self.version);
             if let Ok((_, Some(point_id))) = res {
                 self.id_tracker
                     .borrow_mut()
@@ -265,7 +265,17 @@ impl Segment {
     ) -> OperationResult<Option<Vec<VectorElementType>>> {
         check_vector_name(vector_name, &self.segment_config)?;
         let vector_data = &self.vector_data[vector_name];
-        Ok(vector_data.vector_storage.borrow().get_vector(point_offset))
+        if !self.id_tracker.borrow().is_deleted(point_offset) {
+            Ok(Some(
+                vector_data
+                    .vector_storage
+                    .borrow()
+                    .get_vector(point_offset)
+                    .to_vec(),
+            ))
+        } else {
+            Ok(None)
+        }
     }
 
     fn all_vectors_by_offset(
@@ -280,7 +290,7 @@ impl Segment {
                     .vector_storage
                     .borrow()
                     .get_vector(point_offset)
-                    .unwrap(),
+                    .to_vec(),
             );
         }
         Ok(vectors)
@@ -407,8 +417,7 @@ impl Segment {
                 let point_offset = scored_point_offset.idx;
                 let point_version = id_tracker.internal_version(point_offset).ok_or_else(|| {
                     OperationError::service_error(format!(
-                        "Corrupter id_tracker, no version for point {}",
-                        point_id
+                        "Corrupter id_tracker, no version for point {point_id}"
                     ))
                 })?;
                 let payload = if with_payload.enable {
@@ -505,34 +514,18 @@ impl Segment {
     /// Check consistency of the segment's data and repair it if possible.
     pub fn check_consistency_and_repair(&mut self) -> OperationResult<()> {
         let mut internal_ids_to_delete = HashSet::new();
-        for (_vector_name, vector_storage) in self.vector_data.iter() {
-            let id_tracker = self.id_tracker.borrow();
-            let vector_storage = vector_storage.vector_storage.borrow();
-            for internal_id in vector_storage.iter_ids() {
-                if id_tracker.external_id(internal_id).is_none() {
-                    internal_ids_to_delete.insert(internal_id);
-                }
+        let id_tracker = self.id_tracker.borrow();
+        for internal_id in id_tracker.iter_ids() {
+            if id_tracker.external_id(internal_id).is_none() {
+                internal_ids_to_delete.insert(internal_id);
             }
         }
+
         if !internal_ids_to_delete.is_empty() {
             log::info!(
                 "Found {} points in vector storage without external id - those will be deleted",
                 internal_ids_to_delete.len(),
             );
-            for (vector_name, vector_storage) in self.vector_data.iter_mut() {
-                // cleanup orphans
-                let mut vector_storage_ref = vector_storage.vector_storage.borrow_mut();
-                for internal_id in &internal_ids_to_delete {
-                    log::debug!(
-                        "Deleting point {} {} without external id",
-                        vector_name,
-                        internal_id
-                    );
-                    // delete dangling vectors
-                    vector_storage_ref.delete(*internal_id)?;
-                }
-            }
-
             for internal_id in &internal_ids_to_delete {
                 self.payload_index.borrow_mut().drop(*internal_id)?;
             }
@@ -674,11 +667,10 @@ impl SegmentEntry for Segment {
 
                 for (vector_name, processed_vector) in processed_vectors {
                     let vector_name: &str = &vector_name;
-                    let processed_vector = processed_vector.into_owned();
                     segment.vector_data[vector_name]
                         .vector_storage
                         .borrow_mut()
-                        .insert_vector(new_index, processed_vector)?;
+                        .insert_vector(new_index, &processed_vector)?;
                 }
                 segment
                     .id_tracker
@@ -699,12 +691,6 @@ impl SegmentEntry for Segment {
             None => Ok(false), // Point already not exists
             Some(internal_id) => {
                 self.handle_version_and_failure(op_num, Some(internal_id), |segment| {
-                    for vector_data in segment.vector_data.values() {
-                        vector_data
-                            .vector_storage
-                            .borrow_mut()
-                            .delete(internal_id)?;
-                    }
                     segment.payload_index.borrow_mut().drop(internal_id)?;
                     segment.id_tracker.borrow_mut().drop(point_id)?;
                     Ok((true, Some(internal_id)))
@@ -719,13 +705,18 @@ impl SegmentEntry for Segment {
         point_id: PointIdType,
         full_payload: &Payload,
     ) -> OperationResult<bool> {
-        let internal_id = self.lookup_internal_id(point_id)?;
-        self.handle_version_and_failure(op_num, Some(internal_id), |segment| {
-            segment
-                .payload_index
-                .borrow_mut()
-                .assign_all(internal_id, full_payload)?;
-            Ok((true, Some(internal_id)))
+        let internal_id = self.id_tracker.borrow().internal_id(point_id);
+        self.handle_version_and_failure(op_num, internal_id, |segment| match internal_id {
+            Some(internal_id) => {
+                segment
+                    .payload_index
+                    .borrow_mut()
+                    .assign_all(internal_id, full_payload)?;
+                Ok((true, Some(internal_id)))
+            }
+            None => Err(OperationError::PointIdError {
+                missed_point_id: point_id,
+            }),
         })
     }
 
@@ -735,13 +726,18 @@ impl SegmentEntry for Segment {
         point_id: PointIdType,
         payload: &Payload,
     ) -> OperationResult<bool> {
-        let internal_id = self.lookup_internal_id(point_id)?;
-        self.handle_version_and_failure(op_num, Some(internal_id), |segment| {
-            segment
-                .payload_index
-                .borrow_mut()
-                .assign(internal_id, payload)?;
-            Ok((true, Some(internal_id)))
+        let internal_id = self.id_tracker.borrow().internal_id(point_id);
+        self.handle_version_and_failure(op_num, internal_id, |segment| match internal_id {
+            Some(internal_id) => {
+                segment
+                    .payload_index
+                    .borrow_mut()
+                    .assign(internal_id, payload)?;
+                Ok((true, Some(internal_id)))
+            }
+            None => Err(OperationError::PointIdError {
+                missed_point_id: point_id,
+            }),
         })
     }
 
@@ -751,13 +747,18 @@ impl SegmentEntry for Segment {
         point_id: PointIdType,
         key: PayloadKeyTypeRef,
     ) -> OperationResult<bool> {
-        let internal_id = self.lookup_internal_id(point_id)?;
-        self.handle_version_and_failure(op_num, Some(internal_id), |segment| {
-            segment
-                .payload_index
-                .borrow_mut()
-                .delete(internal_id, key)?;
-            Ok((true, Some(internal_id)))
+        let internal_id = self.id_tracker.borrow().internal_id(point_id);
+        self.handle_version_and_failure(op_num, internal_id, |segment| match internal_id {
+            Some(internal_id) => {
+                segment
+                    .payload_index
+                    .borrow_mut()
+                    .delete(internal_id, key)?;
+                Ok((true, Some(internal_id)))
+            }
+            None => Err(OperationError::PointIdError {
+                missed_point_id: point_id,
+            }),
         })
     }
 
@@ -766,10 +767,15 @@ impl SegmentEntry for Segment {
         op_num: SeqNumberType,
         point_id: PointIdType,
     ) -> OperationResult<bool> {
-        let internal_id = self.lookup_internal_id(point_id)?;
-        self.handle_version_and_failure(op_num, Some(internal_id), |segment| {
-            segment.payload_index.borrow_mut().drop(internal_id)?;
-            Ok((true, Some(internal_id)))
+        let internal_id = self.id_tracker.borrow().internal_id(point_id);
+        self.handle_version_and_failure(op_num, internal_id, |segment| match internal_id {
+            Some(internal_id) => {
+                segment.payload_index.borrow_mut().drop(internal_id)?;
+                Ok((true, Some(internal_id)))
+            }
+            None => Err(OperationError::PointIdError {
+                missed_point_id: point_id,
+            }),
         })
     }
 
@@ -783,8 +789,9 @@ impl SegmentEntry for Segment {
         if let Some(vector) = vector_opt {
             Ok(vector)
         } else {
+            let segment_path = self.current_path.display();
             Err(OperationError::service_error(format!(
-                "Vector {vector_name} not found at offset {internal_id}"
+                "Vector {vector_name} not found at offset {internal_id} for point {point_id}, segment {segment_path}",
             )))
         }
     }
@@ -904,12 +911,7 @@ impl SegmentEntry for Segment {
     }
 
     fn deleted_count(&self) -> usize {
-        let vector_data = self.vector_data.values().next();
-        if let Some(vector_data) = vector_data {
-            vector_data.vector_storage.borrow().deleted_count()
-        } else {
-            0
-        }
+        self.id_tracker.borrow().deleted_count()
     }
 
     fn segment_type(&self) -> SegmentType {
@@ -1020,21 +1022,15 @@ impl SegmentEntry for Segment {
         let flush_op = move || {
             // Flush mapping first to prevent having orphan internal ids.
             id_tracker_mapping_flusher().map_err(|err| {
-                OperationError::service_error(format!(
-                    "Failed to flush id_tracker mapping: {}",
-                    err
-                ))
+                OperationError::service_error(format!("Failed to flush id_tracker mapping: {err}"))
             })?;
             for vector_storage_flusher in vector_storage_flushers {
                 vector_storage_flusher().map_err(|err| {
-                    OperationError::service_error(format!(
-                        "Failed to flush vector_storage: {}",
-                        err
-                    ))
+                    OperationError::service_error(format!("Failed to flush vector_storage: {err}"))
                 })?;
             }
             payload_index_flusher().map_err(|err| {
-                OperationError::service_error(format!("Failed to flush payload_index: {}", err))
+                OperationError::service_error(format!("Failed to flush payload_index: {err}"))
             })?;
             // Id Tracker contains versions of points. We need to flush it after vector_storage and payload_index flush.
             // This is because vector_storage and payload_index flush are not atomic.
@@ -1043,13 +1039,10 @@ impl SegmentEntry for Segment {
             //  by simply overriding data in vector and payload storages.
             // Once versions are saved - points are considered persisted.
             id_tracker_versions_flusher().map_err(|err| {
-                OperationError::service_error(format!(
-                    "Failed to flush id_tracker versions: {}",
-                    err
-                ))
+                OperationError::service_error(format!("Failed to flush id_tracker versions: {err}"))
             })?;
             Self::save_state(&state, &current_path).map_err(|err| {
-                OperationError::service_error(format!("Failed to flush segment state: {}", err))
+                OperationError::service_error(format!("Failed to flush segment state: {err}"))
             })?;
             *persisted_version.lock() = state.version;
 
@@ -1181,7 +1174,7 @@ impl SegmentEntry for Segment {
         // flush segment to capture latest state
         self.flush(true)?;
 
-        let tmp_path = self.current_path.join("tmp");
+        let tmp_path = self.current_path.join(format!("tmp-{}", Uuid::new_v4()));
 
         let db_backup_path = tmp_path.join(DB_BACKUP_PATH);
         let payload_index_db_backup_path = tmp_path.join(PAYLOAD_DB_BACKUP_PATH);
@@ -1261,9 +1254,17 @@ impl SegmentEntry for Segment {
 
         builder.finish()?;
 
-        fs::remove_dir_all(&tmp_path).map_err(|err| {
-            OperationError::service_error(format!("failed to remove {tmp_path:?} directory: {err}"))
-        })?;
+        // remove tmp directory in background
+        let _ = std::thread::spawn(move || {
+            let res = std::fs::remove_dir_all(&tmp_path);
+            if let Err(err) = res {
+                log::error!(
+                    "Failed to remove tmp directory at {}: {:?}",
+                    tmp_path.display(),
+                    err
+                );
+            }
+        });
 
         Ok(archive_path)
     }
@@ -1352,7 +1353,7 @@ mod tests {
             )]),
             index: Indexes::Plain {},
             storage_type: StorageType::InMemory,
-            payload_storage_type: Default::default(),
+            ..Default::default()
         };
         let mut segment = build_segment(dir.path(), &config).unwrap();
 
@@ -1378,7 +1379,7 @@ mod tests {
                 None,
             )
             .unwrap();
-        eprintln!("search_result = {:#?}", search_result);
+        eprintln!("search_result = {search_result:#?}");
 
         let search_batch_result = segment
             .search_batch(
@@ -1391,7 +1392,7 @@ mod tests {
                 None,
             )
             .unwrap();
-        eprintln!("search_batch_result = {:#?}", search_batch_result);
+        eprintln!("search_batch_result = {search_batch_result:#?}");
 
         assert!(!search_result.is_empty());
         assert_eq!(search_result, search_batch_result[0].clone())
@@ -1421,7 +1422,7 @@ mod tests {
             )]),
             index: Indexes::Plain {},
             storage_type: StorageType::InMemory,
-            payload_storage_type: Default::default(),
+            ..Default::default()
         };
 
         let mut segment = build_segment(dir.path(), &config).unwrap();
@@ -1509,7 +1510,7 @@ mod tests {
             )]),
             index: Indexes::Plain {},
             storage_type: StorageType::InMemory,
-            payload_storage_type: Default::default(),
+            ..Default::default()
         };
 
         let mut segment = build_segment(segment_base_dir.path(), &config).unwrap();
@@ -1586,7 +1587,7 @@ mod tests {
             )]),
             index: Indexes::Plain {},
             storage_type: StorageType::InMemory,
-            payload_storage_type: Default::default(),
+            ..Default::default()
         };
 
         let mut segment = build_segment(segment_base_dir.path(), &config).unwrap();
@@ -1617,6 +1618,7 @@ mod tests {
             index: Indexes::Plain {},
             storage_type: StorageType::InMemory,
             payload_storage_type: Default::default(),
+            quantization_config: None,
         };
         let mut segment = build_segment(dir.path(), &config).unwrap();
 

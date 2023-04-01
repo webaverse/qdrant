@@ -45,6 +45,7 @@ pub const LON_RANGE: Range<f64> = -180.0..180.0;
 pub const LAT_RANGE: Range<f64> = -90.0..90.0;
 
 pub const STR_KEY: &str = "kvd";
+pub const STR_PROJ_KEY: &str = "kvd_proj";
 pub const INT_KEY: &str = "int";
 pub const INT_KEY_2: &str = "int2";
 pub const FLT_KEY: &str = "flt";
@@ -59,7 +60,7 @@ pub fn random_adj<R: Rng + ?Sized>(rnd_gen: &mut R) -> String {
 pub fn random_keyword<R: Rng + ?Sized>(rnd_gen: &mut R) -> String {
     let random_adj = ADJECTIVE.choose(rnd_gen).unwrap();
     let random_noun = NOUN.choose(rnd_gen).unwrap();
-    format!("{} {}", random_adj, random_noun)
+    format!("{random_adj} {random_noun}")
 }
 
 pub fn random_keyword_payload<R: Rng + ?Sized>(
@@ -220,6 +221,24 @@ pub fn random_filter<R: Rng + ?Sized>(rnd_gen: &mut R, total_conditions: usize) 
     }
 }
 
+pub fn random_nested_filter<R: Rng + ?Sized>(rnd_gen: &mut R) -> Filter {
+    let nested_or_proj: bool = rnd_gen.gen();
+    let nested_str_key = if nested_or_proj {
+        format!("{}.{}.{}", STR_KEY, "nested_1", "nested_2")
+    } else {
+        format!("{}.{}[].{}", STR_PROJ_KEY, "nested_1", "nested_2")
+    };
+    let condition = Condition::Field(FieldCondition::new_match(
+        nested_str_key,
+        random_keyword(rnd_gen).into(),
+    ));
+    Filter {
+        should: Some(vec![condition]),
+        must: None,
+        must_not: None,
+    }
+}
+
 pub fn generate_diverse_payload<R: Rng + ?Sized>(rnd_gen: &mut R) -> Payload {
     let payload: Payload = if rnd_gen.gen_range(0.0..1.0) < 0.5 {
         json!({
@@ -245,4 +264,20 @@ pub fn generate_diverse_payload<R: Rng + ?Sized>(rnd_gen: &mut R) -> Payload {
     };
 
     payload
+}
+
+pub fn generate_diverse_nested_payload<R: Rng + ?Sized>(rnd_gen: &mut R) -> Payload {
+    json!({
+        STR_KEY: {
+            "nested_1": {
+                "nested_2": random_keyword_payload(rnd_gen, 1..=3)
+            }
+        },
+        STR_PROJ_KEY: {
+            "nested_1": [
+                { "nested_2": random_keyword_payload(rnd_gen, 1..=3) }
+            ]
+        },
+    })
+    .into()
 }

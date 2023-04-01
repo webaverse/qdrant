@@ -1,6 +1,5 @@
 use std::collections::HashSet;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread;
 use std::thread::JoinHandle;
@@ -16,11 +15,11 @@ use raft::eraftpb::Message as RaftMessage;
 use raft::prelude::*;
 use raft::{SoftState, StateRole, INVALID_ID};
 use storage::content_manager::consensus_manager::ConsensusStateRef;
-use storage::content_manager::consensus_ops::ConsensusOperations;
+use storage::content_manager::consensus_ops::{ConsensusOperations, SnapshotStatus};
 use storage::content_manager::errors::StorageError;
 use storage::content_manager::toc::TableOfContent;
 use storage::types::PeerAddressById;
-use tokio::runtime::Runtime;
+use tokio::runtime::Handle;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::time::sleep;
 use tonic::transport::Uri;
@@ -47,7 +46,7 @@ pub struct Consensus {
     /// Receives proposals from peers and client for applying in consensus
     receiver: Receiver<Message>,
     /// Runtime for async message sending
-    runtime: Runtime,
+    runtime: Handle,
     /// Uri to some other known peer, used to join the consensus
     /// ToDo: Make if many
     bootstrap_uri: Option<Uri>,
@@ -70,6 +69,7 @@ impl Consensus {
         propose_receiver: mpsc::Receiver<ConsensusOperations>,
         telemetry_collector: Arc<parking_lot::Mutex<TonicTelemetryCollector>>,
         toc: Arc<TableOfContent>,
+        runtime: Handle,
     ) -> anyhow::Result<JoinHandle<std::io::Result<()>>> {
         let (mut consensus, message_sender) = Self::new(
             logger,
@@ -79,6 +79,7 @@ impl Consensus {
             p2p_port,
             config,
             channel_service,
+            runtime.clone(),
         )?;
 
         let state_ref_clone = state_ref.clone();
@@ -90,6 +91,7 @@ impl Consensus {
                     state_ref_clone.on_consensus_thread_err(err);
                 } else {
                     log::info!("Consensus stopped");
+                    state_ref_clone.on_consensus_stopped();
                     state_ref_clone.on_consensus_stopped();
                 }
             })?;
@@ -119,6 +121,7 @@ impl Consensus {
                     p2p_host,
                     p2p_port,
                     message_sender,
+                    runtime,
                 )
             })
             .unwrap();
@@ -136,6 +139,7 @@ impl Consensus {
         p2p_port: u16,
         config: ConsensusConfig,
         channel_service: ChannelService,
+        runtime: Handle,
     ) -> anyhow::Result<(Self, Sender<Message>)> {
         // raft will not return entries to the application smaller or equal to `applied`
         let last_applied = state_ref.last_applied_entry().unwrap_or_default();
@@ -155,14 +159,6 @@ impl Consensus {
             log::warn!("With current tick period of {}ms, operation commit time might exceed default wait timeout: {}ms",
                  config.tick_period_ms, op_wait.as_millis())
         }
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .thread_name_fn(|| {
-                static ATOMIC_ID: AtomicUsize = AtomicUsize::new(0);
-                let id = ATOMIC_ID.fetch_add(1, Ordering::SeqCst);
-                format!("consensus-tokio-rt-{}", id)
-            })
-            .enable_all()
-            .build()?;
         // bounded channel for backpressure
         let (sender, receiver) = tokio::sync::mpsc::channel(config.max_message_queue_size);
         // State might be initialized but the node might be shutdown without actually syncing or committing anything.
@@ -175,7 +171,7 @@ impl Consensus {
                 uri,
                 p2p_port,
                 &config,
-                &runtime,
+                runtime.clone(),
                 leader_established_in_ms,
             )
             .map_err(|err| anyhow!("Failed to initialize Consensus for new Raft state: {}", err))?;
@@ -218,7 +214,7 @@ impl Consensus {
         uri: Option<String>,
         p2p_port: u16,
         config: &ConsensusConfig,
-        runtime: &Runtime,
+        runtime: Handle,
         leader_established_in_ms: u64,
     ) -> anyhow::Result<()> {
         if let Some(bootstrap_peer) = bootstrap_peer {
@@ -337,7 +333,7 @@ impl Consensus {
                     RECOVERY_RETRY_TIMEOUT * (RECOVERY_MAX_RETRY_COUNT - tries) as u32;
                 sleep(exp_timeout).await;
             }
-            log::error!("Failed to recover from any peer");
+            return Err(anyhow::anyhow!("Failed to recover from any known peers"));
         }
 
         Ok(())
@@ -483,6 +479,15 @@ impl Consensus {
                         log::debug!("Proposing network configuration change: {:?}", change);
                         self.node.propose_conf_change(uri.into_bytes(), change)
                     }
+                    ConsensusOperations::RequestSnapshot { request_index } => {
+                        self.node.request_snapshot(
+                            request_index.unwrap_or_else(|| self.node.store().hard_state().commit),
+                        )
+                    }
+                    ConsensusOperations::ReportSnapshot { peer_id, status } => {
+                        self.node.report_snapshot(peer_id, status.into());
+                        Ok(())
+                    }
                     _ => {
                         let message = match serde_cbor::to_vec(&operation) {
                             Ok(message) => message,
@@ -624,9 +629,10 @@ impl Consensus {
         if !ready.snapshot().is_empty() {
             // This is a snapshot, we need to apply the snapshot at first.
             log::debug!("Applying snapshot");
-            store
-                .apply_snapshot(&ready.snapshot().clone())
-                .map_err(|err| anyhow!("Failed to apply snapshot: {}", err))?
+
+            if let Err(err) = store.apply_snapshot(&ready.snapshot().clone())? {
+                log::error!("Failed to apply snapshot: {err}");
+            }
         }
         if !ready.entries().is_empty() {
             // Append entries to the Raft log.
@@ -810,13 +816,16 @@ async fn send_message(
     store: ConsensusStateRef,
     timeout: Duration,
 ) {
+    let is_snapshot = message.msg_type == raft::eraftpb::MessageType::MsgSnapshot as i32;
+    let peer_id = message.to;
+
     let mut bytes = Vec::new();
     if let Err(err) = <RaftMessage as prost::Message>::encode(&message, &mut bytes) {
         format!("Failed to serialize Raft message: {err}");
     }
     let message = &GrpcRaftMessage { message: bytes };
 
-    if let Err(err) = transport_channel_pool
+    let result = transport_channel_pool
         .with_channel_timeout(
             &address,
             |channel| async move {
@@ -827,11 +836,36 @@ async fn send_message(
             },
             Some(timeout),
         )
-        .await
-    {
-        store.record_message_send_failure(&address, err);
-    } else {
-        store.record_message_send_success(&address)
+        .await;
+
+    if is_snapshot {
+        // Should we ignore the error? Seems like it will only produce noise.
+        //
+        // - `send_message` is only called by the sub-task spawned by the consnsus thread.
+        // - `report_snapshot` sends a message back to the consensus thread.
+        // - It can only fail, if the "receiver" end of the channel is closed.
+        // - Which means consensus thread either resolved successfully, or failed.
+        // - So, if the consensus thread is shutting down, no need to log a misleading error...
+        // - ...or, if the consensus thread failed, then we should already have an error,
+        //   and it will only produce more noise.
+
+        let res = store.report_snapshot(
+            peer_id,
+            if result.is_ok() {
+                SnapshotStatus::Finish
+            } else {
+                SnapshotStatus::Failure
+            },
+        );
+
+        if let Err(err) = res {
+            log::error!("{}", err);
+        }
+    }
+
+    match result {
+        Ok(_) => store.record_message_send_success(&address),
+        Err(err) => store.record_message_send_failure(&address, err),
     }
 }
 
@@ -856,6 +890,7 @@ mod tests {
     use tempfile::Builder;
 
     use super::Consensus;
+    use crate::common::helpers::create_general_purpose_runtime;
     use crate::settings::ConsensusConfig;
 
     #[test]
@@ -866,15 +901,24 @@ mod tests {
         settings.storage.storage_path = storage_dir.path().to_str().unwrap().to_string();
         std::env::set_var("RUST_LOG", log::Level::Debug.as_str());
         env_logger::init();
-        let runtime = crate::create_search_runtime(settings.storage.performance.max_search_threads)
-            .expect("Can't create runtime.");
+        let search_runtime =
+            crate::create_search_runtime(settings.storage.performance.max_search_threads)
+                .expect("Can't create search runtime.");
+        let update_runtime =
+            crate::create_update_runtime(settings.storage.performance.max_search_threads)
+                .expect("Can't create update runtime.");
+        let general_runtime =
+            create_general_purpose_runtime().expect("Can't create general purpose runtime.");
+        let handle = general_runtime.handle().clone();
         let (propose_sender, propose_receiver) = std::sync::mpsc::channel();
         let persistent_state =
             Persistent::load_or_init(&settings.storage.storage_path, true).unwrap();
         let operation_sender = OperationSender::new(propose_sender);
         let toc = TableOfContent::new(
             &settings.storage,
-            runtime,
+            search_runtime,
+            update_runtime,
+            general_runtime,
             ChannelService::default(),
             persistent_state.this_peer_id(),
             Some(operation_sender.clone()),
@@ -898,6 +942,7 @@ mod tests {
             6335,
             ConsensusConfig::default(),
             ChannelService::default(),
+            handle.clone(),
         )
         .unwrap();
 
@@ -924,8 +969,7 @@ mod tests {
         // When
 
         // New runtime is used as timers need to be enabled.
-        tokio::runtime::Runtime::new()
-            .unwrap()
+        handle
             .block_on(
                 dispatcher.submit_collection_meta_op(
                     CollectionMetaOperations::CreateCollection(CreateCollectionOperation::new(
@@ -943,6 +987,8 @@ mod tests {
                             on_disk_payload: None,
                             replication_factor: None,
                             write_consistency_factor: None,
+                            init_from: None,
+                            quantization_config: None,
                         },
                     )),
                     None,
@@ -951,7 +997,7 @@ mod tests {
             .unwrap();
 
         // Then
-        assert_eq!(consensus_state.hard_state().commit, 5); // Collection + Nop + 2 of shard activations
+        assert_eq!(consensus_state.hard_state().commit, 4); // Collection + 2 of shard activations
         assert_eq!(toc_arc.all_collections_sync(), vec!["test"]);
     }
 }

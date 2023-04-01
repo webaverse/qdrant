@@ -1,6 +1,7 @@
 use std::env;
 
 use config::{Config, ConfigError, Environment, File};
+use segment::common::cpu::get_num_cpus;
 use serde::Deserialize;
 use storage::types::StorageConfig;
 
@@ -75,6 +76,12 @@ pub struct Settings {
     pub service: ServiceConfig,
     #[serde(default)]
     pub cluster: ClusterConfig,
+    #[serde(default = "default_telemetry_disabled")]
+    pub telemetry_disabled: bool,
+}
+
+fn default_telemetry_disabled() -> bool {
+    false
 }
 
 fn default_cors() -> bool {
@@ -126,7 +133,7 @@ impl Settings {
             // Add in the current environment file
             // Default to 'development' env
             // Note that this file is _optional_
-            .add_source(File::with_name(&format!("config/{}", env)).required(false))
+            .add_source(File::with_name(&format!("config/{env}")).required(false))
             // Add in a local configuration file
             // This file shouldn't be checked in to git
             .add_source(File::with_name("config/local").required(false))
@@ -146,7 +153,7 @@ pub fn max_web_workers(settings: &Settings) -> usize {
     let max_workers = settings.service.max_workers;
 
     if max_workers == Some(0) {
-        let num_cpu = num_cpus::get();
+        let num_cpu = get_num_cpus();
         std::cmp::max(1, num_cpu - 1)
     } else if max_workers.is_none() {
         settings.storage.performance.max_search_threads

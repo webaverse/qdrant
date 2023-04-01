@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 
 use collection::operations::payload_ops::{PayloadOps, SetPayload};
-use collection::operations::point_ops::{Batch, PointOperations, PointStruct};
+use collection::operations::point_ops::{Batch, PointOperations, PointStruct, WriteOrdering};
 use collection::operations::types::{
     CountRequest, PointRequest, RecommendRequest, ScrollRequest, SearchRequest, UpdateStatus,
 };
@@ -13,7 +13,6 @@ use segment::types::{
     Condition, FieldCondition, Filter, HasIdCondition, Payload, PointIdType, WithPayloadInterface,
 };
 use tempfile::Builder;
-use tokio::runtime::Handle;
 
 use crate::common::{load_local_collection, simple_collection_fixture, N_SHARDS};
 
@@ -49,13 +48,15 @@ async fn test_collection_updater_with_shards(shard_number: u32) {
         .into(),
     );
 
-    let insert_result = collection.update_from_client(insert_points, true).await;
+    let insert_result = collection
+        .update_from_client(insert_points, true, WriteOrdering::default())
+        .await;
 
     match insert_result {
         Ok(res) => {
             assert_eq!(res.status, UpdateStatus::Completed)
         }
-        Err(err) => panic!("operation failed: {:?}", err),
+        Err(err) => panic!("operation failed: {err:?}"),
     }
 
     let search_request = SearchRequest {
@@ -69,9 +70,7 @@ async fn test_collection_updater_with_shards(shard_number: u32) {
         score_threshold: None,
     };
 
-    let search_res = collection
-        .search(search_request, &Handle::current(), None)
-        .await;
+    let search_res = collection.search(search_request, None, None).await;
 
     match search_res {
         Ok(res) => {
@@ -79,7 +78,7 @@ async fn test_collection_updater_with_shards(shard_number: u32) {
             assert_eq!(res[0].id, 2.into());
             assert!(res[0].payload.is_none());
         }
-        Err(err) => panic!("search failed: {:?}", err),
+        Err(err) => panic!("search failed: {err:?}"),
     }
     collection.before_drop().await;
 }
@@ -107,13 +106,15 @@ async fn test_collection_search_with_payload_and_vector_with_shards(shard_number
         .into(),
     );
 
-    let insert_result = collection.update_from_client(insert_points, true).await;
+    let insert_result = collection
+        .update_from_client(insert_points, true, WriteOrdering::default())
+        .await;
 
     match insert_result {
         Ok(res) => {
             assert_eq!(res.status, UpdateStatus::Completed)
         }
-        Err(err) => panic!("operation failed: {:?}", err),
+        Err(err) => panic!("operation failed: {err:?}"),
     }
 
     let search_request = SearchRequest {
@@ -127,9 +128,7 @@ async fn test_collection_search_with_payload_and_vector_with_shards(shard_number
         score_threshold: None,
     };
 
-    let search_res = collection
-        .search(search_request, &Handle::current(), None)
-        .await;
+    let search_res = collection.search(search_request, None, None).await;
 
     match search_res {
         Ok(res) => {
@@ -141,7 +140,7 @@ async fn test_collection_search_with_payload_and_vector_with_shards(shard_number
                 _ => panic!("vector is not returned"),
             }
         }
-        Err(err) => panic!("search failed: {:?}", err),
+        Err(err) => panic!("search failed: {err:?}"),
     }
 
     let count_request = CountRequest {
@@ -194,7 +193,7 @@ async fn test_collection_loading_with_shards(shard_number: u32) {
         );
 
         collection
-            .update_from_client(insert_points, true)
+            .update_from_client(insert_points, true, WriteOrdering::default())
             .await
             .unwrap();
 
@@ -208,7 +207,7 @@ async fn test_collection_loading_with_shards(shard_number: u32) {
             }));
 
         collection
-            .update_from_client(assign_payload, true)
+            .update_from_client(assign_payload, true, WriteOrdering::default())
             .await
             .unwrap();
         collection.before_drop().await;
@@ -226,7 +225,10 @@ async fn test_collection_loading_with_shards(shard_number: u32) {
         with_payload: Some(WithPayloadInterface::Bool(true)),
         with_vector: true.into(),
     };
-    let retrieved = loaded_collection.retrieve(request, None).await.unwrap();
+    let retrieved = loaded_collection
+        .retrieve(request, None, None)
+        .await
+        .unwrap();
 
     assert_eq!(retrieved.len(), 2);
 
@@ -322,7 +324,7 @@ async fn test_recommendation_api_with_shards(shard_number: u32) {
     );
 
     collection
-        .update_from_client(insert_points, true)
+        .update_from_client(insert_points, true, WriteOrdering::default())
         .await
         .unwrap();
     let result = recommend_by(
@@ -332,9 +334,9 @@ async fn test_recommendation_api_with_shards(shard_number: u32) {
             limit: 5,
             ..Default::default()
         },
-        &Handle::current(),
         &collection,
         |_name| async { unreachable!("Should not be called in this test") },
+        None,
     )
     .await
     .unwrap();
@@ -379,7 +381,7 @@ async fn test_read_api_with_shards(shard_number: u32) {
     ));
 
     collection
-        .update_from_client(insert_points, true)
+        .update_from_client(insert_points, true, WriteOrdering::default())
         .await
         .unwrap();
 
@@ -392,6 +394,7 @@ async fn test_read_api_with_shards(shard_number: u32) {
                 with_payload: Some(WithPayloadInterface::Bool(true)),
                 with_vector: false.into(),
             },
+            None,
             None,
         )
         .await
@@ -432,13 +435,15 @@ async fn test_collection_delete_points_by_filter_with_shards(shard_number: u32) 
         .into(),
     );
 
-    let insert_result = collection.update_from_client(insert_points, true).await;
+    let insert_result = collection
+        .update_from_client(insert_points, true, WriteOrdering::default())
+        .await;
 
     match insert_result {
         Ok(res) => {
             assert_eq!(res.status, UpdateStatus::Completed)
         }
-        Err(err) => panic!("operation failed: {:?}", err),
+        Err(err) => panic!("operation failed: {err:?}"),
     }
 
     // delete points with id (0, 3)
@@ -453,13 +458,15 @@ async fn test_collection_delete_points_by_filter_with_shards(shard_number: u32) 
         PointOperations::DeletePointsByFilter(delete_filter),
     );
 
-    let delete_result = collection.update_from_client(delete_points, true).await;
+    let delete_result = collection
+        .update_from_client(delete_points, true, WriteOrdering::default())
+        .await;
 
     match delete_result {
         Ok(res) => {
             assert_eq!(res.status, UpdateStatus::Completed)
         }
-        Err(err) => panic!("operation failed: {:?}", err),
+        Err(err) => panic!("operation failed: {err:?}"),
     }
 
     let result = collection
@@ -471,6 +478,7 @@ async fn test_collection_delete_points_by_filter_with_shards(shard_number: u32) 
                 with_payload: Some(WithPayloadInterface::Bool(false)),
                 with_vector: false.into(),
             },
+            None,
             None,
         )
         .await

@@ -9,6 +9,7 @@ use std::time::Duration;
 use anyhow::{anyhow, Context};
 use chrono::Utc;
 use collection::collection_state;
+use collection::common::is_ready::IsReady;
 use collection::shards::shard::PeerId;
 use collection::shards::CollectionId;
 use futures::future::join_all;
@@ -22,19 +23,17 @@ use tokio::time::error::Elapsed;
 use tonic::transport::Uri;
 
 use super::alias_mapping::AliasMapping;
-use super::consensus_ops::ConsensusOperations;
+use super::consensus_ops::{ConsensusOperations, SnapshotStatus};
 use super::errors::StorageError;
 use super::CollectionContainer;
 use crate::content_manager::consensus::consensus_wal::ConsensusOpWal;
 use crate::content_manager::consensus::entry_queue::EntryId;
-use crate::content_manager::consensus::is_ready::IsReady;
 use crate::content_manager::consensus::operation_sender::OperationSender;
 use crate::content_manager::consensus::persistent::Persistent;
 use crate::types::{
     ClusterInfo, ClusterStatus, ConsensusThreadStatus, MessageSendErrors, PeerAddressById,
     PeerInfo, RaftInfo,
 };
-use crate::CollectionMetaOperations;
 
 pub const DEFAULT_META_OP_WAIT: Duration = Duration::from_secs(10);
 
@@ -117,6 +116,20 @@ impl<C: CollectionContainer> ConsensusManager<C> {
             }),
             message_send_failures: Default::default(),
         }
+    }
+
+    pub fn report_snapshot(
+        &self,
+        peer_id: u64,
+        status: impl Into<SnapshotStatus>,
+    ) -> Result<(), StorageError> {
+        self.propose_sender
+            .send(ConsensusOperations::report_snapshot(peer_id, status))
+            .map_err(|_err| {
+                StorageError::service_error(
+                    "failed to send ReportSnapshot message to consensus thread",
+                )
+            })
     }
 
     pub fn record_message_send_failure<E: Error>(&self, peer_address: &Uri, error: E) {
@@ -423,6 +436,7 @@ impl<C: CollectionContainer> ConsensusManager<C> {
             ConsensusOperations::CollectionMeta(operation) => {
                 self.toc.perform_collection_meta_op(*operation)
             }
+
             ConsensusOperations::AddPeer { .. } | ConsensusOperations::RemovePeer(_) => {
                 // RemovePeer or AddPeer should be converted into native ConfChangeV2 message before sending to the Raft.
                 // So we do not expect to receive these operations as a normal entry.
@@ -434,6 +448,9 @@ impl<C: CollectionContainer> ConsensusManager<C> {
                 );
                 Ok(false)
             }
+
+            ConsensusOperations::RequestSnapshot { .. }
+            | ConsensusOperations::ReportSnapshot { .. } => unreachable!(),
         };
 
         if let Some(on_apply) = on_apply {
@@ -444,18 +461,21 @@ impl<C: CollectionContainer> ConsensusManager<C> {
         result
     }
 
-    pub fn apply_snapshot(&self, snapshot: &raft::eraftpb::Snapshot) -> Result<(), StorageError> {
+    // Outer `Result` is "fatal" error, inner `Result` is "transient"/"local" error.
+    pub fn apply_snapshot(
+        &self,
+        snapshot: &raft::eraftpb::Snapshot,
+    ) -> Result<Result<(), StorageError>, StorageError> {
         let meta = snapshot.get_metadata();
-        if raft::Storage::first_index(self)? > meta.index {
-            return Err(StorageError::service_error("Snapshot out of date"));
-        }
+
         let data: SnapshotData = snapshot.get_data().try_into()?;
         self.toc.apply_collections_snapshot(data.collections_data)?;
         self.wal.lock().clear()?;
         self.persistent
             .write()
             .update_from_snapshot(meta, data.address_by_id)?;
-        Ok(())
+
+        Ok(Ok(()))
     }
 
     pub fn set_hard_state(&self, hard_state: raft::eraftpb::HardState) -> Result<(), StorageError> {
@@ -510,7 +530,7 @@ impl<C: CollectionContainer> ConsensusManager<C> {
             .await
             .map_err(
                 |_: Elapsed| {
-                    StorageError::service_error(&format!(
+                    StorageError::service_error(format!(
                         "Waiting for consensus operation commit failed. Timeout set at: {} seconds",
                         wait_timeout.as_secs_f64()
                     ))
@@ -563,7 +583,6 @@ impl<C: CollectionContainer> ConsensusManager<C> {
         &self,
         operation: ConsensusOperations,
         wait_timeout: Option<Duration>,
-        with_confirmation: bool,
     ) -> Result<bool, StorageError> {
         let wait_timeout = wait_timeout.unwrap_or(DEFAULT_META_OP_WAIT);
 
@@ -571,7 +590,7 @@ impl<C: CollectionContainer> ConsensusManager<C> {
             .is_leader_established
             .await_ready_for_timeout(wait_timeout)
         {
-            return Err(StorageError::service_error(&format!(
+            return Err(StorageError::service_error(format!(
                 "Failed to propose operation: leader is not established within {} secs",
                 wait_timeout.as_secs()
             )));
@@ -584,25 +603,6 @@ impl<C: CollectionContainer> ConsensusManager<C> {
             on_apply_lock.insert(operation, sender);
         }
         let res = Self::await_receiver(receiver, wait_timeout).await?;
-
-        // Send explicit empty operation to ensure that all previous operations are applied.
-        // Assume that peer can not accept new operations until it applies all previous ones.
-        if with_confirmation {
-            let random_token: usize = rand::random();
-            // Send empty operation to make sure that the majority of consensus applied the operation
-            let empty_operation =
-                ConsensusOperations::CollectionMeta(Box::new(CollectionMetaOperations::Nop {
-                    token: random_token,
-                }));
-            let (sender, receiver) = oneshot::channel();
-            {
-                let mut on_apply_lock = self.on_consensus_op_apply.lock();
-                self.propose_sender.send(empty_operation.clone())?;
-                on_apply_lock.insert(empty_operation, sender);
-            }
-            Self::await_receiver(receiver, wait_timeout).await?;
-        }
-
         Ok(res)
     }
 
@@ -926,7 +926,7 @@ mod tests {
 
     prop_compose! {
         fn gen_entries(min_entries: u64, max_entries: u64)(n in min_entries..max_entries, inc_term_every in 1u64..max_entries) -> Vec<Entry> {
-            (1..(n+1)).into_iter().map(|index| Entry {index, term: 1 + index/inc_term_every, ..Default::default()}).collect::<Vec<Entry>>()
+            (1..=n).map(|index| Entry {index, term: 1 + index/inc_term_every, ..Default::default()}).collect::<Vec<Entry>>()
         }
     }
 

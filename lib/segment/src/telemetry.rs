@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::common::anonymize::Anonymize;
 use crate::common::operation_time_statistics::OperationDurationStatistics;
-use crate::types::{SegmentConfig, SegmentInfo, VectorDataConfig};
+use crate::types::{PayloadIndexInfo, SegmentConfig, SegmentInfo, VectorDataConfig};
 
 #[derive(Serialize, Deserialize, Clone, Debug, JsonSchema)]
 pub struct VectorIndexesTelemetry {
@@ -84,7 +84,21 @@ impl Anonymize for SegmentInfo {
             ram_usage_bytes: self.ram_usage_bytes.anonymize(),
             disk_usage_bytes: self.disk_usage_bytes.anonymize(),
             is_appendable: self.is_appendable,
-            index_schema: self.index_schema.clone(),
+            index_schema: self
+                .index_schema
+                .iter()
+                .map(|(k, v)| (k.anonymize(), v.anonymize()))
+                .collect(),
+        }
+    }
+}
+
+impl Anonymize for PayloadIndexInfo {
+    fn anonymize(&self) -> Self {
+        PayloadIndexInfo {
+            data_type: self.data_type,
+            params: self.params.clone(),
+            points: self.points.anonymize(),
         }
     }
 }
@@ -96,6 +110,7 @@ impl Anonymize for SegmentConfig {
             index: self.index,
             storage_type: self.storage_type,
             payload_storage_type: self.payload_storage_type,
+            quantization_config: self.quantization_config.clone(),
         }
     }
 }

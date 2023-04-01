@@ -4,7 +4,8 @@ mod tests {
     use std::sync::atomic::AtomicBool;
 
     use itertools::Itertools;
-    use rand::{thread_rng, Rng};
+    use rand::prelude::StdRng;
+    use rand::{Rng, SeedableRng};
     use segment::data_types::vectors::{only_default_vector, DEFAULT_VECTOR_NAME};
     use segment::entry::entry_point::SegmentEntry;
     use segment::fixtures::payload_fixtures::{random_int_payload, random_vector};
@@ -34,7 +35,7 @@ mod tests {
         let indexing_threshold = 500; // num vectors
         let num_payload_values = 2;
 
-        let mut rnd = thread_rng();
+        let mut rnd = StdRng::seed_from_u64(42);
 
         let dir = Builder::new().prefix("segment_dir").tempdir().unwrap();
         let hnsw_dir = Builder::new().prefix("hnsw_dir").tempdir().unwrap();
@@ -49,7 +50,7 @@ mod tests {
             )]),
             index: Indexes::Plain {},
             storage_type: StorageType::InMemory,
-            payload_storage_type: Default::default(),
+            ..Default::default()
         };
 
         let int_key = "int";
@@ -84,6 +85,7 @@ mod tests {
 
         let mut hnsw_index = HNSWIndex::<GraphLinksRam>::open(
             hnsw_dir.path(),
+            segment.id_tracker.clone(),
             segment.vector_data[DEFAULT_VECTOR_NAME]
                 .vector_storage
                 .clone(),
@@ -163,7 +165,7 @@ mod tests {
                 top,
                 Some(&SearchParams {
                     hnsw_ef: Some(ef),
-                    exact: false,
+                    ..Default::default()
                 }),
             );
 
@@ -176,7 +178,7 @@ mod tests {
                 hits += 1;
             }
         }
-        assert!(attempts - hits < 5, "hits: {} of {}", hits, attempts); // Not more than 5% failures
-        eprintln!("hits = {:#?} out of {}", hits, attempts);
+        assert!(attempts - hits < 5, "hits: {hits} of {attempts}"); // Not more than 5% failures
+        eprintln!("hits = {hits:#?} out of {attempts}");
     }
 }

@@ -237,8 +237,7 @@ where
             read_bin(graph_path)
         } else {
             Err(FileStorageError::generic_error(&format!(
-                "Links file does not exists: {:?}",
-                links_path
+                "Links file does not exists: {links_path:?}"
             )))
         };
 
@@ -307,7 +306,7 @@ mod tests {
     ) -> Vec<ScoredPointOffset> {
         let fake_filter_context = FakeFilterContext {};
         let raw_scorer = vector_storage.get_raw_scorer(query.to_owned());
-        let scorer = FilteredScorer::new(&raw_scorer, Some(&fake_filter_context));
+        let scorer = FilteredScorer::new(raw_scorer.as_ref(), Some(&fake_filter_context));
         let ef = 16;
         graph.search(top, ef, scorer)
     }
@@ -347,7 +346,7 @@ mod tests {
         let fake_filter_context = FakeFilterContext {};
         let added_vector = vector_holder.vectors.get(linking_idx).to_vec();
         let raw_scorer = vector_holder.get_raw_scorer(added_vector);
-        let mut scorer = FilteredScorer::new(&raw_scorer, Some(&fake_filter_context));
+        let mut scorer = FilteredScorer::new(raw_scorer.as_ref(), Some(&fake_filter_context));
 
         let nearest_on_level = graph_layers.search_on_level(
             ScoredPointOffset {
@@ -433,8 +432,8 @@ mod tests {
             .map(|i| graph_layers.links.links(i as PointOffsetType, 0).len())
             .sum::<usize>();
 
-        eprintln!("total_links_0 = {:#?}", total_links_0);
-        eprintln!("num_vectors = {:#?}", num_vectors);
+        eprintln!("total_links_0 = {total_links_0:#?}");
+        eprintln!("num_vectors = {num_vectors:#?}");
         assert!(total_links_0 > 0);
         assert!(total_links_0 as f64 / num_vectors as f64 > M as f64);
 
@@ -483,11 +482,7 @@ mod tests {
 
         let mut file = File::create("graph.json").unwrap();
         file.write_all(
-            format!(
-                "{{ \"graph\": {}, \n \"vectors\": {} }}",
-                graph_json, vectors_json
-            )
-            .as_bytes(),
+            format!("{{ \"graph\": {graph_json}, \n \"vectors\": {vectors_json} }}").as_bytes(),
         )
         .unwrap();
     }

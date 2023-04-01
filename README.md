@@ -12,7 +12,7 @@
     <a href="https://qdrant.github.io/qdrant/redoc/index.html"><img src="https://img.shields.io/badge/Docs-OpenAPI%203.0-success" alt="OpenAPI Docs"></a>
     <a href="https://github.com/qdrant/qdrant/blob/master/LICENSE"><img src="https://img.shields.io/badge/License-Apache%202.0-success" alt="Apache 2.0 License"></a>
     <a href="https://qdrant.to/discord"><img src="https://img.shields.io/badge/Discord-Qdrant-5865F2.svg?logo=discord" alt="Discord"></a>
-    <a href="https://qdrant.to/roadmap"><img src="https://img.shields.io/badge/Roadmap-v1.0-bc1439.svg" alt="Roadmap v1.0"></a>
+    <a href="https://qdrant.to/roadmap"><img src="https://img.shields.io/badge/Roadmap-2023-bc1439.svg" alt="Roadmap 2023"></a>
 </p>
 
 **Qdrant** (read: _quadrant_ ) is a vector similarity search engine and vector database.
@@ -23,7 +23,7 @@ Qdrant is written in Rust 🦀, which makes it fast and reliable even under high
 
 With Qdrant, embeddings or neural network encoders can be turned into full-fledged applications for matching, searching, recommending, and much more!
 
-Also available as managed solution in the **Qdrant Cloud** https://qdrant.to/cloud ⛅
+Also available as managed solution in the **Qdrant Cloud** https://cloud.qdrant.io/ ⛅
 
 ## Demo Projects
 
@@ -257,6 +257,9 @@ Thanks to the people who contributed to Qdrant:
       <td align="center" valign="top" width="14.28%"><a href="https://github.com/erare-humanum"><img src="https://avatars.githubusercontent.com/u/116254494?v=4?s=50" width="50px;" alt="erare-humanum"/><br /><sub><b>erare-humanum</b></sub></a><br /><a href="https://github.com/qdrant/qdrant/commits?author=erare-humanum" title="Code">💻</a></td>
       <td align="center" valign="top" width="14.28%"><a href="https://github.com/ffuugoo"><img src="https://avatars.githubusercontent.com/u/2725918?v=4?s=50" width="50px;" alt="Roman Titov"/><br /><sub><b>Roman Titov</b></sub></a><br /><a href="https://github.com/qdrant/qdrant/commits?author=ffuugoo" title="Code">💻</a></td>
       <td align="center" valign="top" width="14.28%"><a href="http://hozan23.com"><img src="https://avatars.githubusercontent.com/u/119854621?v=4?s=50" width="50px;" alt="Hozan"/><br /><sub><b>Hozan</b></sub></a><br /><a href="https://github.com/qdrant/qdrant/commits?author=hozan23" title="Code">💻</a></td>
+      <td align="center" valign="top" width="14.28%"><a href="https://github.com/joein"><img src="https://avatars.githubusercontent.com/u/22641570?v=4?s=50" width="50px;" alt="George"/><br /><sub><b>George</b></sub></a><br /><a href="https://github.com/qdrant/qdrant/commits?author=joein" title="Code">💻</a></td>
+      <td align="center" valign="top" width="14.28%"><a href="https://github.com/csko"><img src="https://avatars.githubusercontent.com/u/749306?v=4?s=50" width="50px;" alt="Kornél Csernai"/><br /><sub><b>Kornél Csernai</b></sub></a><br /><a href="https://github.com/qdrant/qdrant/commits?author=csko" title="Code">💻</a></td>
+      <td align="center" valign="top" width="14.28%"><a href="http://coszio.github.io"><img src="https://avatars.githubusercontent.com/u/62079184?v=4?s=50" width="50px;" alt="Luis Cossío"/><br /><sub><b>Luis Cossío</b></sub></a><br /><a href="https://github.com/qdrant/qdrant/commits?author=coszio" title="Documentation">📖</a></td>
     </tr>
   </tbody>
 </table>

@@ -27,10 +27,10 @@ pub struct TelemetryCollector {
 #[derive(Serialize, Deserialize, Clone, Debug, JsonSchema)]
 pub struct TelemetryData {
     id: String,
-    app: AppBuildTelemetry,
-    collections: CollectionsTelemetry,
-    cluster: ClusterTelemetry,
-    requests: RequestsTelemetry,
+    pub(crate) app: AppBuildTelemetry,
+    pub(crate) collections: CollectionsTelemetry,
+    pub(crate) cluster: ClusterTelemetry,
+    pub(crate) requests: RequestsTelemetry,
 }
 
 impl Anonymize for TelemetryData {
@@ -46,9 +46,17 @@ impl Anonymize for TelemetryData {
 }
 
 impl TelemetryCollector {
-    pub fn new(settings: Settings, dispatcher: Arc<Dispatcher>) -> Self {
+    pub fn reporting_id(&self) -> String {
+        self.process_id.to_string()
+    }
+
+    pub fn generate_id() -> Uuid {
+        Uuid::new_v4()
+    }
+
+    pub fn new(settings: Settings, dispatcher: Arc<Dispatcher>, id: Uuid) -> Self {
         Self {
-            process_id: Uuid::new_v4(),
+            process_id: id,
             settings,
             dispatcher,
             actix_telemetry_collector: Arc::new(Mutex::new(ActixTelemetryCollector {

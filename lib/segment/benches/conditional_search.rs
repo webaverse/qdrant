@@ -1,3 +1,4 @@
+#[cfg(not(target_os = "windows"))]
 mod prof;
 
 use criterion::{criterion_group, criterion_main, Criterion};
@@ -100,8 +101,8 @@ fn conditional_struct_search_benchmark(c: &mut Criterion) {
 
     let indexed_fields = struct_index.indexed_fields();
 
-    eprintln!("cardinality = {:#?}", cardinality);
-    eprintln!("indexed_fields = {:#?}", indexed_fields);
+    eprintln!("cardinality = {cardinality:#?}");
+    eprintln!("indexed_fields = {indexed_fields:#?}");
 
     group.bench_function("struct-conditional-search-query-points", |b| {
         b.iter(|| {
@@ -143,9 +144,17 @@ fn conditional_struct_search_benchmark(c: &mut Criterion) {
     group.finish();
 }
 
+#[cfg(not(target_os = "windows"))]
 criterion_group! {
     name = benches;
     config = Criterion::default().with_profiler(prof::FlamegraphProfiler::new(100));
+    targets = conditional_struct_search_benchmark, conditional_plain_search_benchmark
+}
+
+#[cfg(target_os = "windows")]
+criterion_group! {
+    name = benches;
+    config = Criterion::default();
     targets = conditional_struct_search_benchmark, conditional_plain_search_benchmark
 }
 

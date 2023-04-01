@@ -77,11 +77,10 @@ mod tests {
     #[tokio::test]
     async fn test_task_stop() {
         let handle = spawn_stoppable(long_task);
-
-        thread::sleep(Duration::from_millis(STEP_MILLIS * 5));
-        handle.ask_to_stop();
+        tokio::time::sleep(Duration::from_millis(STEP_MILLIS * 5)).await;
         assert!(!handle.is_finished());
-        thread::sleep(Duration::from_millis(STEP_MILLIS));
+        handle.ask_to_stop();
+        tokio::time::sleep(Duration::from_millis(STEP_MILLIS * 3)).await;
         assert!(handle.is_finished());
 
         let res = handle.stop().await.unwrap();

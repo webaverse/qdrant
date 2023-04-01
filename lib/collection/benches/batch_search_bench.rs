@@ -1,5 +1,6 @@
 #![allow(deprecated)]
 
+#[cfg(not(target_os = "windows"))]
 mod prof;
 
 use std::num::{NonZeroU32, NonZeroU64};
@@ -83,6 +84,7 @@ fn batch_search_bench(c: &mut Criterion) {
         },
         wal_config,
         hnsw_config: Default::default(),
+        quantization_config: Default::default(),
     };
 
     let shared_config = Arc::new(RwLock::new(collection_config));
@@ -93,6 +95,8 @@ fn batch_search_bench(c: &mut Criterion) {
             "test_collection".to_string(),
             storage_dir.path(),
             shared_config,
+            Default::default(),
+            handle.clone(),
         ))
         .unwrap();
 

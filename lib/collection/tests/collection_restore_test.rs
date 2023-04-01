@@ -1,4 +1,6 @@
-use collection::operations::point_ops::{Batch, PointInsertOperations, PointOperations};
+use collection::operations::point_ops::{
+    Batch, PointInsertOperations, PointOperations, WriteOrdering,
+};
 use collection::operations::types::ScrollRequest;
 use collection::operations::CollectionUpdateOperations;
 use itertools::Itertools;
@@ -39,7 +41,7 @@ async fn test_collection_reloading_with_shards(shard_number: u32) {
             })),
         );
         collection
-            .update_from_client(insert_points, true)
+            .update_from_client(insert_points, true, WriteOrdering::default())
             .await
             .unwrap();
         collection.before_drop().await;
@@ -74,7 +76,7 @@ async fn test_collection_payload_reloading_with_shards(shard_number: u32) {
             })),
         );
         collection
-            .update_from_client(insert_points, true)
+            .update_from_client(insert_points, true, WriteOrdering::default())
             .await
             .unwrap();
         collection.before_drop().await;
@@ -97,6 +99,7 @@ async fn test_collection_payload_reloading_with_shards(shard_number: u32) {
                 with_vector: true.into(),
             },
             None,
+            None,
         )
         .await
         .unwrap();
@@ -108,6 +111,7 @@ async fn test_collection_payload_reloading_with_shards(shard_number: u32) {
         .as_ref()
         .expect("has payload")
         .get_value("k")
+        .next()
         .expect("has value")
     {
         Value::String(value) => assert_eq!("v1", value),
@@ -142,7 +146,7 @@ async fn test_collection_payload_custom_payload_with_shards(shard_number: u32) {
             })),
         );
         collection
-            .update_from_client(insert_points, true)
+            .update_from_client(insert_points, true, WriteOrdering::default())
             .await
             .unwrap();
         collection.before_drop().await;
@@ -167,6 +171,7 @@ async fn test_collection_payload_custom_payload_with_shards(shard_number: u32) {
                 with_vector: true.into(),
             },
             None,
+            None,
         )
         .await
         .unwrap();
@@ -181,6 +186,7 @@ async fn test_collection_payload_custom_payload_with_shards(shard_number: u32) {
         .as_ref()
         .expect("has payload")
         .get_value("k2")
+        .next()
         .expect("has value")
     {
         Value::String(value) => assert_eq!("v3", value),
@@ -197,6 +203,7 @@ async fn test_collection_payload_custom_payload_with_shards(shard_number: u32) {
                 with_payload: Some(PayloadSelectorExclude::new(vec!["k1".to_string()]).into()),
                 with_vector: false.into(),
             },
+            None,
             None,
         )
         .await
@@ -221,6 +228,7 @@ async fn test_collection_payload_custom_payload_with_shards(shard_number: u32) {
         .as_ref()
         .expect("has payload")
         .get_value("k3")
+        .next()
         .expect("has value")
     {
         Value::String(value) => assert_eq!("v4", value),

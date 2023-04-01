@@ -2,7 +2,8 @@ use std::path::Path;
 use std::sync::Arc;
 
 use schemars::JsonSchema;
-use segment::types::HnswConfig;
+use segment::common::cpu::get_num_cpus;
+use segment::types::{HnswConfig, QuantizationConfig};
 use serde::{Deserialize, Serialize};
 
 use crate::collection_manager::optimizers::indexing_optimizer::IndexingOptimizer;
@@ -76,7 +77,7 @@ impl OptimizersConfig {
 
     pub fn get_number_segments(&self) -> usize {
         if self.default_segment_number == 0 {
-            let num_cpus = num_cpus::get();
+            let num_cpus = get_num_cpus();
             // Do not configure less than 2 and more than 8 segments
             // until it is not explicitly requested
             num_cpus.clamp(2, 8)
@@ -89,7 +90,7 @@ impl OptimizersConfig {
         if let Some(max_segment_size) = self.max_segment_size {
             max_segment_size
         } else {
-            let num_cpus = num_cpus::get();
+            let num_cpus = get_num_cpus();
             num_cpus.saturating_mul(DEFAULT_MAX_SEGMENT_PER_CPU_KB)
         }
     }
@@ -100,6 +101,7 @@ pub fn build_optimizers(
     collection_params: &CollectionParams,
     optimizers_config: &OptimizersConfig,
     hnsw_config: &HnswConfig,
+    quantization_config: &Option<QuantizationConfig>,
 ) -> Arc<Vec<Arc<Optimizer>>> {
     let segments_path = shard_path.join("segments");
     let temp_segments_path = shard_path.join("temp_segments");
@@ -118,6 +120,7 @@ pub fn build_optimizers(
             temp_segments_path.clone(),
             collection_params.clone(),
             *hnsw_config,
+            quantization_config.clone(),
         )),
         Arc::new(IndexingOptimizer::new(
             threshold_config.clone(),
@@ -125,6 +128,7 @@ pub fn build_optimizers(
             temp_segments_path.clone(),
             collection_params.clone(),
             *hnsw_config,
+            quantization_config.clone(),
         )),
         Arc::new(VacuumOptimizer::new(
             optimizers_config.deleted_threshold,
@@ -134,6 +138,7 @@ pub fn build_optimizers(
             temp_segments_path,
             collection_params.clone(),
             *hnsw_config,
+            quantization_config.clone(),
         )),
     ])
 }

@@ -3,7 +3,7 @@ import os
 import shutil
 from subprocess import Popen
 import time
-from typing import Tuple, Callable, Dict, List
+from typing import Tuple, Callable, Dict, List, Optional
 import requests
 import socket
 from contextlib import closing
@@ -72,11 +72,16 @@ def init_pytest_log_folder() -> str:
 
 
 # Starts a peer and returns its api_uri
-def start_peer(peer_dir: Path, log_file: str, bootstrap_uri: str, port=None) -> str:
+def start_peer(peer_dir: Path, log_file: str, bootstrap_uri: str, port=None, extra_env=None) -> str:
+    if extra_env is None:
+        extra_env = {}
     p2p_port = get_port() if port is None else port + 0
     grpc_port = get_port() if port is None else port + 1
     http_port = get_port() if port is None else port + 2
-    env = get_env(p2p_port, grpc_port, http_port)
+    env = {
+        **get_env(p2p_port, grpc_port, http_port),
+        **extra_env
+    }
     test_log_folder = init_pytest_log_folder()
     log_file = open(f"{test_log_folder}/{log_file}", "w")
     print(f"Starting follower peer with bootstrap uri {bootstrap_uri},"
@@ -156,11 +161,37 @@ def get_cluster_info(peer_api_uri: str) -> dict:
 
 def print_clusters_info(peer_api_uris: [str]):
     for uri in peer_api_uris:
-        print(json.dumps(get_cluster_info(uri), indent=4))
+        try:
+            # do not crash if the peer is not online
+            print(json.dumps(get_cluster_info(uri), indent=4))
+        except requests.exceptions.ConnectionError:
+            print(f"Can't retrieve cluster info for offline peer {uri}")
+
+
+def fetch_highest_peer_id(peer_api_uris: [str]) -> str:
+    max_peer_id = 0
+    max_peer_url = None
+    for uri in peer_api_uris:
+        try:
+            # do not crash if the peer is not online
+            peer_id = get_cluster_info(uri)['peer_id']
+            if peer_id > max_peer_id:
+                max_peer_id = peer_id
+                max_peer_url = uri
+        except requests.exceptions.ConnectionError:
+            print(f"Can't retrieve cluster info for offline peer {uri}")
+    return max_peer_url
 
 
 def get_collection_cluster_info(peer_api_uri: str, collection_name: str) -> dict:
     r = requests.get(f"{peer_api_uri}/collections/{collection_name}/cluster")
+    assert_http_ok(r)
+    res = r.json()["result"]
+    return res
+
+
+def get_collection_info(peer_api_uri: str, collection_name: str) -> dict:
+    r = requests.get(f"{peer_api_uri}/collections/{collection_name}")
     assert_http_ok(r)
     res = r.json()["result"]
     return res
@@ -227,6 +258,16 @@ def all_nodes_cluster_info_consistent(peer_api_uris: [str], expected_leader: str
             return False
     return True
 
+def all_nodes_respond(peer_api_uris: [str]) -> bool:
+    for uri in peer_api_uris:
+        try:
+            r = requests.get(f"{uri}/collections")
+            assert_http_ok(r)
+        except requests.exceptions.ConnectionError:
+            print(f"Could not contact peer {uri} to fetch collections")
+            return False
+    return True
+
 
 def collection_exists_on_all_peers(collection_name: str, peer_api_uris: [str]) -> bool:
     for uri in peer_api_uris:
@@ -272,6 +313,12 @@ def check_some_replicas_not_active(peer_api_uri: str, collection_name: str) -> b
     return not check_all_replicas_active(peer_api_uri, collection_name)
 
 
+def check_collection_cluster(peer_url, collection_name):
+    res = requests.get(f"{peer_url}/collections/{collection_name}/cluster", timeout=10)
+    assert_http_ok(res)
+    return res.json()["result"]['local_shards'][0]
+
+
 WAIT_TIME_SEC = 30
 RETRY_INTERVAL_SEC = 0.5
 
@@ -301,6 +348,13 @@ def wait_for_all_replicas_active(peer_api_uri: str, collection_name: str):
 def wait_for_uniform_cluster_status(peer_api_uris: [str], expected_leader: str):
     try:
         wait_for(all_nodes_cluster_info_consistent, peer_api_uris, expected_leader)
+    except Exception as e:
+        print_clusters_info(peer_api_uris)
+        raise e
+
+def wait_all_peers_up(peer_api_uris: [str]):
+    try:
+        wait_for(all_nodes_respond, peer_api_uris)
     except Exception as e:
         print_clusters_info(peer_api_uris)
         raise e
@@ -355,6 +409,19 @@ def wait_for_peer_online(peer_api_uri: str):
         wait_for(peer_is_online, peer_api_uri)
     except Exception as e:
         print_clusters_info([peer_api_uri])
+        raise e
+
+
+def check_collection_size(peer_api_uri: str, collection_name: str, expected_size: int) -> bool:
+    collection_cluster_info = get_collection_info(peer_api_uri, collection_name)
+    return collection_cluster_info['points_count'] == expected_size
+
+
+def wait_collection_size(peer_api_uri: str, collection_name: str, expected_size: int):
+    try:
+        wait_for(check_collection_size, peer_api_uri, collection_name, expected_size)
+    except Exception as e:
+        print_collection_cluster_info(peer_api_uri, collection_name)
         raise e
 
 

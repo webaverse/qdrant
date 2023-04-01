@@ -10,7 +10,7 @@ use collection::operations::types::{CollectionError, VectorParams};
 use collection::optimizers_builder::OptimizersConfig;
 use collection::shards::channel_service::ChannelService;
 use collection::shards::collection_shard_distribution::CollectionShardDistribution;
-use collection::shards::replica_set::{OnPeerFailure, ReplicaState};
+use collection::shards::replica_set::{ChangePeerState, ReplicaState};
 use collection::shards::CollectionId;
 use segment::types::Distance;
 
@@ -56,6 +56,7 @@ pub async fn simple_collection_fixture(collection_path: &Path, shard_number: u32
         optimizer_config: TEST_OPTIMIZERS_CONFIG.clone(),
         wal_config,
         hnsw_config: Default::default(),
+        quantization_config: Default::default(),
     };
 
     let snapshot_path = collection_path.join("snapshots");
@@ -71,7 +72,7 @@ pub async fn simple_collection_fixture(collection_path: &Path, shard_number: u32
     .unwrap()
 }
 
-pub fn dummy_on_replica_failure() -> OnPeerFailure {
+pub fn dummy_on_replica_failure() -> ChangePeerState {
     Arc::new(move |_peer_id, _shard_id| {})
 }
 
@@ -93,10 +94,13 @@ pub async fn new_local_collection(
         path,
         snapshots_path,
         config,
+        Default::default(),
         CollectionShardDistribution::all_local(Some(config.params.shard_number.into()), 0),
         ChannelService::default(),
         dummy_on_replica_failure(),
         dummy_request_shard_transfer(),
+        None,
+        None,
     )
     .await;
 
@@ -105,7 +109,7 @@ pub async fn new_local_collection(
     let local_shards = collection.get_local_shards().await;
     for shard_id in local_shards {
         collection
-            .set_shard_replica_state(shard_id, 0, ReplicaState::Active)
+            .set_shard_replica_state(shard_id, 0, ReplicaState::Active, None)
             .await?;
     }
     Ok(collection)
@@ -123,9 +127,12 @@ pub async fn load_local_collection(
         0,
         path,
         snapshots_path,
+        Default::default(),
         ChannelService::default(),
         dummy_on_replica_failure(),
         dummy_request_shard_transfer(),
+        None,
+        None,
     )
     .await
 }

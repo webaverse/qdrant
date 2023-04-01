@@ -4,16 +4,18 @@ use std::sync::Arc;
 
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
+use tokio::runtime::Handle;
 use tokio::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use crate::config::CollectionConfig;
 use crate::hash_ring::HashRing;
-use crate::operations::types::{CollectionError, CollectionResult, ShardTransferInfo};
+use crate::operations::shared_storage_config::SharedStorageConfig;
+use crate::operations::types::{CollectionResult, ShardTransferInfo};
 use crate::operations::{OperationToShard, SplitByShard};
 use crate::save_on_disk::SaveOnDisk;
 use crate::shards::channel_service::ChannelService;
 use crate::shards::local_shard::LocalShard;
-use crate::shards::replica_set::{OnPeerFailure, ReplicaState, ShardReplicaSet};
+use crate::shards::replica_set::{ChangePeerState, ReplicaState, ShardReplicaSet};
 use crate::shards::shard::{PeerId, ShardId};
 use crate::shards::shard_config::{ShardConfig, ShardType};
 use crate::shards::shard_versioning::latest_shard_paths;
@@ -153,20 +155,6 @@ impl ShardHolder {
             .collect()
     }
 
-    pub fn set_shard_replica_state(
-        &self,
-        shard_id: ShardId,
-        peer_id: PeerId,
-        active: ReplicaState,
-    ) -> CollectionResult<()> {
-        let replica_set = self
-            .get_shard(&shard_id)
-            .ok_or_else(|| CollectionError::NotFound {
-                what: format!("Shard {shard_id}"),
-            })?;
-        replica_set.set_replica_state(&peer_id, active)
-    }
-
     pub fn target_shard(
         &self,
         shard_selection: Option<ShardId>,
@@ -201,21 +189,19 @@ impl ShardHolder {
         self.shards.is_empty()
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn load_shards(
         &mut self,
         collection_path: &Path,
         collection_id: &CollectionId,
-        shared_collection_config: Arc<RwLock<CollectionConfig>>,
+        collection_config: Arc<RwLock<CollectionConfig>>,
+        shared_storage_config: Arc<SharedStorageConfig>,
         channel_service: ChannelService,
-        on_peer_failure: OnPeerFailure,
+        on_peer_failure: ChangePeerState,
         this_peer_id: PeerId,
+        update_runtime: Handle,
     ) {
-        let shard_number = shared_collection_config
-            .read()
-            .await
-            .params
-            .shard_number
-            .get();
+        let shard_number = collection_config.read().await.params.shard_number.get();
         // ToDo: remove after version 0.11.0
         for shard_id in 0..shard_number {
             for (path, _shard_version, shard_type) in
@@ -225,10 +211,12 @@ impl ShardHolder {
                     shard_id,
                     collection_id.clone(),
                     &path,
-                    shared_collection_config.clone(),
+                    collection_config.clone(),
+                    shared_storage_config.clone(),
                     channel_service.clone(),
                     on_peer_failure.clone(),
                     this_peer_id,
+                    update_runtime.clone(),
                 )
                 .await;
 
@@ -239,7 +227,9 @@ impl ShardHolder {
                             shard_id,
                             collection_id.clone(),
                             &path,
-                            shared_collection_config.clone(),
+                            collection_config.clone(),
+                            shared_storage_config.clone(),
+                            update_runtime.clone(),
                         )
                         .await
                         .unwrap();
@@ -259,7 +249,9 @@ impl ShardHolder {
                             shard_id,
                             collection_id.clone(),
                             &path,
-                            shared_collection_config.clone(),
+                            collection_config.clone(),
+                            shared_storage_config.clone(),
+                            update_runtime.clone(),
                         )
                         .await
                         .unwrap();
@@ -279,7 +271,7 @@ impl ShardHolder {
                 if require_migration {
                     ShardConfig::new_replica_set()
                         .save(&path)
-                        .map_err(|e| panic!("Failed to save shard config {:?}: {}", path, e))
+                        .map_err(|e| panic!("Failed to save shard config {path:?}: {e}"))
                         .unwrap();
                 }
                 self.add_shard(shard_id, replica_set);

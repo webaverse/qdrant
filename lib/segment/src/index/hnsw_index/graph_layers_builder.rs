@@ -445,10 +445,10 @@ mod tests {
     use crate::index::hnsw_index::tests::create_graph_layer_fixture;
     use crate::spaces::metric::Metric;
     use crate::spaces::simple::{CosineMetric, EuclidMetric};
-    use crate::vector_storage::RawScorer;
 
     const M: usize = 8;
 
+    #[cfg(not(windows))]
     fn parallel_graph_build<TMetric: Metric + Sync + Send, R>(
         num_vectors: usize,
         dim: usize,
@@ -489,7 +489,8 @@ mod tests {
                     let fake_filter_context = FakeFilterContext {};
                     let added_vector = vector_holder.vectors.get(idx).to_vec();
                     let raw_scorer = vector_holder.get_raw_scorer(added_vector);
-                    let scorer = FilteredScorer::new(&raw_scorer, Some(&fake_filter_context));
+                    let scorer =
+                        FilteredScorer::new(raw_scorer.as_ref(), Some(&fake_filter_context));
                     graph_layers.link_new_point(idx, scorer);
                 });
         });
@@ -530,13 +531,14 @@ mod tests {
             let fake_filter_context = FakeFilterContext {};
             let added_vector = vector_holder.vectors.get(idx).to_vec();
             let raw_scorer = vector_holder.get_raw_scorer(added_vector.clone());
-            let scorer = FilteredScorer::new(&raw_scorer, Some(&fake_filter_context));
+            let scorer = FilteredScorer::new(raw_scorer.as_ref(), Some(&fake_filter_context));
             graph_layers.link_new_point(idx, scorer);
         }
 
         (vector_holder, graph_layers)
     }
 
+    #[cfg(not(windows))] // https://github.com/qdrant/qdrant/issues/1452
     #[test]
     fn test_parallel_graph_build() {
         let num_vectors = 1000;
@@ -575,8 +577,8 @@ mod tests {
 
         assert!(total_links_0 > 0);
 
-        eprintln!("total_links_0 = {:#?}", total_links_0);
-        eprintln!("num_vectors = {:#?}", num_vectors);
+        eprintln!("total_links_0 = {total_links_0:#?}");
+        eprintln!("num_vectors = {num_vectors:#?}");
 
         assert!(total_links_0 as f64 / num_vectors as f64 > M as f64);
 
@@ -598,7 +600,7 @@ mod tests {
 
         let fake_filter_context = FakeFilterContext {};
         let raw_scorer = vector_holder.get_raw_scorer(query);
-        let scorer = FilteredScorer::new(&raw_scorer, Some(&fake_filter_context));
+        let scorer = FilteredScorer::new(raw_scorer.as_ref(), Some(&fake_filter_context));
         let ef = 16;
         let graph_search = graph.search(top, ef, scorer);
 
@@ -658,8 +660,8 @@ mod tests {
 
         assert!(total_links_0 > 0);
 
-        eprintln!("total_links_0 = {:#?}", total_links_0);
-        eprintln!("num_vectors = {:#?}", num_vectors);
+        eprintln!("total_links_0 = {total_links_0:#?}");
+        eprintln!("num_vectors = {num_vectors:#?}");
 
         assert!(total_links_0 as f64 / num_vectors as f64 > M as f64);
 
@@ -681,7 +683,7 @@ mod tests {
 
         let fake_filter_context = FakeFilterContext {};
         let raw_scorer = vector_holder.get_raw_scorer(query);
-        let scorer = FilteredScorer::new(&raw_scorer, Some(&fake_filter_context));
+        let scorer = FilteredScorer::new(raw_scorer.as_ref(), Some(&fake_filter_context));
         let ef = 16;
         let graph_search = graph.search(top, ef, scorer);
 
@@ -706,7 +708,7 @@ mod tests {
         for idx in 0..(NUM_VECTORS as PointOffsetType) {
             let added_vector = vector_holder.vectors.get(idx).to_vec();
             let raw_scorer = vector_holder.get_raw_scorer(added_vector);
-            let scorer = FilteredScorer::new(&raw_scorer, Some(&fake_filter_context));
+            let scorer = FilteredScorer::new(raw_scorer.as_ref(), Some(&fake_filter_context));
             let level = graph_layers_builder.get_random_layer(&mut rng);
             graph_layers_builder.set_levels(idx, level);
             graph_layers_builder.link_new_point(idx, scorer);
@@ -716,7 +718,7 @@ mod tests {
             .unwrap();
 
         let num_points = graph_layers.links.num_points();
-        eprintln!("number_points = {:#?}", num_points);
+        eprintln!("number_points = {num_points:#?}");
 
         let max_layer = (0..NUM_VECTORS)
             .map(|i| graph_layers.links.point_level(i as PointOffsetType))
@@ -728,13 +730,13 @@ mod tests {
         let links910 = (0..layers910 + 1)
             .map(|i| graph_layers.links.links(910, i).to_vec())
             .collect::<Vec<_>>();
-        eprintln!("graph_layers.links_layers[910] = {:#?}", links910,);
+        eprintln!("graph_layers.links_layers[910] = {links910:#?}",);
 
         let total_edges: usize = (0..NUM_VECTORS)
             .map(|i| graph_layers.links.links(i as PointOffsetType, 0).len())
             .sum();
         let avg_connectivity = total_edges as f64 / NUM_VECTORS as f64;
-        eprintln!("avg_connectivity = {:#?}", avg_connectivity);
+        eprintln!("avg_connectivity = {avg_connectivity:#?}");
     }
 
     #[test]
@@ -775,7 +777,7 @@ mod tests {
         );
 
         for x in selected_candidates.iter() {
-            eprintln!("selected_candidates = {}", x);
+            eprintln!("selected_candidates = {x}");
         }
     }
 

@@ -18,18 +18,22 @@ use semver::Version;
 use tar::Builder as TarBuilder;
 use tokio::fs::{copy, create_dir_all, remove_dir_all, remove_file, rename};
 use tokio::runtime::Handle;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock, RwLockWriteGuard};
 
 use crate::collection_state::{ShardInfo, State};
+use crate::common::is_ready::IsReady;
 use crate::config::CollectionConfig;
 use crate::hash_ring::HashRing;
 use crate::operations::config_diff::{CollectionParamsDiff, DiffConfig, OptimizersConfigDiff};
+use crate::operations::consistency_params::ReadConsistency;
+use crate::operations::point_ops::WriteOrdering;
+use crate::operations::shared_storage_config::SharedStorageConfig;
 use crate::operations::snapshot_ops::{
     get_snapshot_description, list_snapshots_in_directory, SnapshotDescription,
 };
 use crate::operations::types::{
     CollectionClusterInfo, CollectionError, CollectionInfo, CollectionResult, CountRequest,
-    CountResult, LocalShardInfo, PointRequest, Record, RemoteShardInfo, ScrollRequest,
+    CountResult, LocalShardInfo, NodeType, PointRequest, Record, RemoteShardInfo, ScrollRequest,
     ScrollResult, SearchRequest, SearchRequestBatch, UpdateResult,
 };
 use crate::operations::{CollectionUpdateOperations, Validate};
@@ -38,16 +42,18 @@ use crate::shards::channel_service::ChannelService;
 use crate::shards::collection_shard_distribution::CollectionShardDistribution;
 use crate::shards::local_shard::LocalShard;
 use crate::shards::remote_shard::RemoteShard;
+use crate::shards::replica_set::ReplicaState::{Active, Dead, Initializing, Listener};
 use crate::shards::replica_set::{
-    Change, OnPeerFailure, ReplicaState, ShardReplicaSet as ReplicaSetShard,
+    Change, ChangePeerState, ReplicaState, ShardReplicaSet as ReplicaSetShard,
 }; // TODO rename ReplicaShard to ReplicaSetShard
 use crate::shards::shard::{PeerId, ShardId};
 use crate::shards::shard_config::{self, ShardConfig};
 use crate::shards::shard_holder::{LockedShardHolder, ShardHolder};
 use crate::shards::shard_versioning::versioned_shard_path;
 use crate::shards::transfer::shard_transfer::{
-    change_remote_shard_route, finalize_partial_shard, handle_transferred_shard_proxy,
-    revert_proxy_shard_to_local, spawn_transfer_task, ShardTransfer, ShardTransferKey,
+    change_remote_shard_route, check_transfer_conflicts, finalize_partial_shard,
+    handle_transferred_shard_proxy, revert_proxy_shard_to_local, spawn_transfer_task,
+    ShardTransfer, ShardTransferKey,
 };
 use crate::shards::transfer::transfer_tasks_pool::{TaskResult, TransferTasksPool};
 use crate::shards::{replica_set, CollectionId, HASH_RING_SHARD_SCALE};
@@ -55,6 +61,7 @@ use crate::telemetry::CollectionTelemetry;
 
 pub type VectorLookupFuture<'a> = Box<dyn Future<Output = CollectionResult<Vec<Record>>> + 'a>;
 pub type OnTransferFailure = Arc<dyn Fn(ShardTransfer, CollectionId, &str) + Send + Sync>;
+pub type OnTransferSuccess = Arc<dyn Fn(ShardTransfer, CollectionId) + Send + Sync>;
 pub type RequestShardTransfer = Arc<dyn Fn(ShardTransfer) + Send + Sync>;
 
 struct CollectionVersion;
@@ -69,7 +76,8 @@ impl StorageVersion for CollectionVersion {
 pub struct Collection {
     pub(crate) id: CollectionId,
     pub(crate) shards_holder: Arc<LockedShardHolder>,
-    pub(crate) config: Arc<RwLock<CollectionConfig>>,
+    pub(crate) collection_config: Arc<RwLock<CollectionConfig>>,
+    pub(crate) shared_storage_config: Arc<SharedStorageConfig>,
     /// Tracks whether `before_drop` fn has been called.
     before_drop_called: bool,
     this_peer_id: PeerId,
@@ -79,8 +87,19 @@ pub struct Collection {
     transfer_tasks: Mutex<TransferTasksPool>,
     request_shard_transfer_cb: RequestShardTransfer,
     #[allow(dead_code)] //Might be useful in case of repartition implementation
-    notify_peer_failure_cb: OnPeerFailure,
+    notify_peer_failure_cb: ChangePeerState,
     init_time: Duration,
+    // One-way boolean flag that is set to true when the collection is fully initialized
+    // i.e. all shards are activated for the first time.
+    is_initialized: Arc<IsReady>,
+    // Lock to temporary block collection update operations while the collection is being migrated.
+    // Lock is acquired for read on update operation and can be acquired for write externally,
+    // which will block all update operations until the lock is released.
+    updates_lock: RwLock<()>,
+    // Search runtime handle.
+    search_runtime: Handle,
+    // Update runtime handle.
+    update_runtime: Handle,
 }
 
 impl Collection {
@@ -94,20 +113,22 @@ impl Collection {
         this_peer_id: PeerId,
         path: &Path,
         snapshots_path: &Path,
-        config: &CollectionConfig,
+        collection_config: &CollectionConfig,
+        shared_storage_config: Arc<SharedStorageConfig>,
         shard_distribution: CollectionShardDistribution,
         channel_service: ChannelService,
-        on_replica_failure: replica_set::OnPeerFailure,
+        on_replica_failure: ChangePeerState,
         request_shard_transfer: RequestShardTransfer,
+        search_runtime: Option<Handle>,
+        update_runtime: Option<Handle>,
     ) -> Result<Self, CollectionError> {
         let start_time = std::time::Instant::now();
 
         let mut shard_holder = ShardHolder::new(path, HashRing::fair(HASH_RING_SHARD_SCALE))?;
 
-        let shared_config = Arc::new(RwLock::new(config.clone()));
+        let shared_collection_config = Arc::new(RwLock::new(collection_config.clone()));
         for (shard_id, mut peers) in shard_distribution.shards {
-            let is_local = peers.contains(&this_peer_id);
-            peers.remove(&this_peer_id);
+            let is_local = peers.remove(&this_peer_id);
 
             let replica_set = ReplicaSetShard::build(
                 shard_id,
@@ -117,8 +138,10 @@ impl Collection {
                 peers,
                 on_replica_failure.clone(),
                 path,
-                shared_config.clone(),
+                shared_collection_config.clone(),
+                shared_storage_config.clone(),
                 channel_service.clone(),
+                update_runtime.clone().unwrap_or_else(Handle::current),
             )
             .await;
 
@@ -129,6 +152,7 @@ impl Collection {
                     return Err(err);
                 }
             };
+
             shard_holder.add_shard(shard_id, replica_set);
         }
 
@@ -136,12 +160,13 @@ impl Collection {
 
         // Once the config is persisted - the collection is considered to be successfully created.
         CollectionVersion::save(path)?;
-        config.save(path)?;
+        collection_config.save(path)?;
 
         Ok(Self {
             id: name.clone(),
             shards_holder: locked_shard_holder,
-            config: shared_config,
+            collection_config: shared_collection_config,
+            shared_storage_config,
             before_drop_called: false,
             this_peer_id,
             path: path.to_owned(),
@@ -151,6 +176,10 @@ impl Collection {
             request_shard_transfer_cb: request_shard_transfer.clone(),
             notify_peer_failure_cb: on_replica_failure.clone(),
             init_time: start_time.elapsed(),
+            is_initialized: Arc::new(Default::default()),
+            updates_lock: RwLock::new(()),
+            search_runtime: search_runtime.unwrap_or_else(Handle::current),
+            update_runtime: update_runtime.unwrap_or_else(Handle::current),
         })
     }
 
@@ -177,14 +206,18 @@ impl Collection {
         true
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn load(
         collection_id: CollectionId,
         this_peer_id: PeerId,
         path: &Path,
         snapshots_path: &Path,
+        shared_storage_config: Arc<SharedStorageConfig>,
         channel_service: ChannelService,
-        on_replica_failure: replica_set::OnPeerFailure,
+        on_replica_failure: replica_set::ChangePeerState,
         request_shard_transfer: RequestShardTransfer,
+        search_runtime: Option<Handle>,
+        update_runtime: Option<Handle>,
     ) -> Self {
         let start_time = std::time::Instant::now();
         let stored_version = CollectionVersion::load(path)
@@ -204,14 +237,14 @@ impl Collection {
             if Self::can_upgrade_storage(&stored_version, &app_version) {
                 log::info!("Migrating collection {stored_version} -> {app_version}");
                 CollectionVersion::save(path)
-                    .unwrap_or_else(|err| panic!("Can't save collection version {}", err));
+                    .unwrap_or_else(|err| panic!("Can't save collection version {err}"));
             } else {
                 log::error!("Cannot upgrade version {stored_version} to {app_version}.");
                 panic!("Cannot upgrade version {stored_version} to {app_version}. Try to use older version of Qdrant first.");
             }
         }
 
-        let config = CollectionConfig::load(path).unwrap_or_else(|err| {
+        let collection_config = CollectionConfig::load(path).unwrap_or_else(|err| {
             panic!(
                 "Can't read collection config due to {}\nat {}",
                 err,
@@ -222,16 +255,18 @@ impl Collection {
         let ring = HashRing::fair(HASH_RING_SHARD_SCALE);
         let mut shard_holder = ShardHolder::new(path, ring).expect("Can not create shard holder");
 
-        let shared_config = Arc::new(RwLock::new(config.clone()));
+        let shared_collection_config = Arc::new(RwLock::new(collection_config.clone()));
 
         shard_holder
             .load_shards(
                 path,
                 &collection_id,
-                shared_config.clone(),
+                shared_collection_config.clone(),
+                shared_storage_config.clone(),
                 channel_service.clone(),
                 on_replica_failure.clone(),
                 this_peer_id,
+                update_runtime.clone().unwrap_or_else(Handle::current),
             )
             .await;
 
@@ -240,7 +275,8 @@ impl Collection {
         Self {
             id: collection_id.clone(),
             shards_holder: locked_shard_holder,
-            config: shared_config,
+            collection_config: shared_collection_config,
+            shared_storage_config,
             before_drop_called: false,
             this_peer_id,
             path: path.to_owned(),
@@ -250,6 +286,10 @@ impl Collection {
             request_shard_transfer_cb: request_shard_transfer.clone(),
             notify_peer_failure_cb: on_replica_failure,
             init_time: start_time.elapsed(),
+            is_initialized: Arc::new(Default::default()),
+            updates_lock: RwLock::new(()),
+            search_runtime: search_runtime.unwrap_or_else(Handle::current),
+            update_runtime: update_runtime.unwrap_or_else(Handle::current),
         }
     }
 
@@ -284,6 +324,7 @@ impl Collection {
         shard_id: ShardId,
         peer_id: PeerId,
         state: ReplicaState,
+        from_state: Option<ReplicaState>,
     ) -> CollectionResult<()> {
         let shard_holder = self.shards_holder.read().await;
         let replica_set =
@@ -294,6 +335,17 @@ impl Collection {
                 })?;
 
         // Validation:
+        // 0. Check that `from_state` matches current state
+
+        if from_state.is_some() {
+            let current_state = replica_set.peer_state(&peer_id);
+            if current_state != from_state {
+                return Err(CollectionError::bad_input(format!(
+                    "Replica {peer_id} of shard {shard_id} has state {current_state:?}, but expected {from_state:?}"
+                )));
+            }
+        }
+
         // 1. Do not deactivate the last active replica
 
         if state != ReplicaState::Active {
@@ -325,6 +377,25 @@ impl Collection {
             for transfer in related_transfers {
                 self._abort_shard_transfer(transfer.key(), &shard_holder)
                     .await?;
+            }
+        }
+
+        if !self.is_initialized.check_ready() {
+            // If not initialized yet, we need to check if it was initialized by this call
+            let state = self.state().await;
+            let mut is_fully_active = true;
+            for (_shard_id, shard_info) in state.shards {
+                if shard_info
+                    .replicas
+                    .into_iter()
+                    .any(|(_peer_id, state)| state != ReplicaState::Active)
+                {
+                    is_fully_active = false;
+                    break;
+                }
+            }
+            if is_fully_active {
+                self.is_initialized.make_ready();
             }
         }
 
@@ -387,12 +458,20 @@ impl Collection {
     }
 
     pub async fn get_outgoing_transfers(&self, current_peer_id: &PeerId) -> Vec<ShardTransfer> {
+        self.get_transfers(|transfer| transfer.from == *current_peer_id)
+            .await
+    }
+
+    pub async fn get_transfers<F>(&self, mut predicate: F) -> Vec<ShardTransfer>
+    where
+        F: FnMut(&ShardTransfer) -> bool,
+    {
         let shard_holder = self.shards_holder.read().await;
         let transfers = shard_holder
             .shard_transfers
             .read()
             .iter()
-            .filter(|transfer| transfer.from == *current_peer_id)
+            .filter(|&transfer| predicate(transfer))
             .cloned()
             .collect();
         transfers
@@ -597,7 +676,9 @@ impl Collection {
                 shard_id,
                 self.name(),
                 &replica_set.shard_path,
-                self.config.clone(),
+                self.collection_config.clone(),
+                self.shared_storage_config.clone(),
+                self.update_runtime.clone(),
             )
             .await?;
 
@@ -624,6 +705,7 @@ impl Collection {
         shard_selection: ShardId,
         wait: bool,
     ) -> CollectionResult<UpdateResult> {
+        let _update_lock = self.updates_lock.read().await;
         let shard_holder_guard = self.shards_holder.read().await;
 
         let res = match shard_holder_guard.get_shard(&shard_selection) {
@@ -635,8 +717,7 @@ impl Collection {
             Ok(res)
         } else {
             Err(CollectionError::service_error(format!(
-                "No target shard {} found for update",
-                shard_selection
+                "No target shard {shard_selection} found for update"
             )))
         }
     }
@@ -645,8 +726,10 @@ impl Collection {
         &self,
         operation: CollectionUpdateOperations,
         wait: bool,
+        ordering: WriteOrdering,
     ) -> CollectionResult<UpdateResult> {
         operation.validate()?;
+        let _update_lock = self.updates_lock.read().await;
 
         let mut results = {
             let shards_holder = self.shards_holder.read().await;
@@ -660,7 +743,9 @@ impl Collection {
 
             let shard_requests = shard_to_op
                 .into_iter()
-                .map(move |(replica_set, operation)| replica_set.update(operation, wait));
+                .map(move |(replica_set, operation)| {
+                    replica_set.update_with_consistency(operation, wait, ordering)
+                });
             join_all(shard_requests).await
         };
 
@@ -701,7 +786,7 @@ impl Collection {
     pub async fn search_batch(
         &self,
         request: SearchRequestBatch,
-        search_runtime_handle: &Handle,
+        read_consistency: Option<ReadConsistency>,
         shard_selection: Option<ShardId>,
     ) -> CollectionResult<Vec<Vec<ScoredPoint>>> {
         // shortcuts batch if all requests with limit=0
@@ -754,11 +839,7 @@ impl Collection {
                 searches: without_payload_requests,
             };
             let without_payload_results = self
-                ._search_batch(
-                    without_payload_batch,
-                    search_runtime_handle,
-                    shard_selection,
-                )
+                ._search_batch(without_payload_batch, read_consistency, shard_selection)
                 .await?;
             let filled_results = without_payload_results
                 .into_iter()
@@ -768,13 +849,14 @@ impl Collection {
                         without_payload_result,
                         req.with_payload.clone(),
                         req.with_vector.unwrap_or_default(),
+                        read_consistency,
                         shard_selection,
                     )
                 });
             try_join_all(filled_results).await
         } else {
             let result = self
-                ._search_batch(request, search_runtime_handle, shard_selection)
+                ._search_batch(request, read_consistency, shard_selection)
                 .await?;
             Ok(result)
         }
@@ -783,7 +865,7 @@ impl Collection {
     pub async fn _search_batch(
         &self,
         request: SearchRequestBatch,
-        search_runtime_handle: &Handle,
+        read_consistency: Option<ReadConsistency>,
         shard_selection: Option<ShardId>,
     ) -> CollectionResult<Vec<Vec<ScoredPoint>>> {
         let batch_size = request.searches.len();
@@ -795,7 +877,7 @@ impl Collection {
             let target_shards = shard_holder.target_shard(shard_selection)?;
             let all_searches = target_shards
                 .iter()
-                .map(|shard| shard.search(request.clone(), search_runtime_handle));
+                .map(|shard| shard.search(request.clone(), read_consistency, &self.search_runtime));
             try_join_all(all_searches).await?
         };
 
@@ -806,7 +888,7 @@ impl Collection {
                 merged_results[index].append(shard_searches_result)
             }
         }
-        let collection_params = self.config.read().await.params.clone();
+        let collection_params = self.collection_config.read().await.params.clone();
         let top_results: Vec<_> = merged_results
             .into_iter()
             .zip(request.searches.iter())
@@ -844,6 +926,7 @@ impl Collection {
         search_result: Vec<ScoredPoint>,
         with_payload: Option<WithPayloadInterface>,
         with_vector: WithVector,
+        read_consistency: Option<ReadConsistency>,
         shard_selection: Option<ShardId>,
     ) -> CollectionResult<Vec<ScoredPoint>> {
         let retrieve_request = PointRequest {
@@ -851,7 +934,9 @@ impl Collection {
             with_payload,
             with_vector,
         };
-        let retrieved_records = self.retrieve(retrieve_request, shard_selection).await?;
+        let retrieved_records = self
+            .retrieve(retrieve_request, read_consistency, shard_selection)
+            .await?;
         let mut records_map: HashMap<ExtendedPointId, Record> = retrieved_records
             .into_iter()
             .map(|rec| (rec.id, rec))
@@ -875,7 +960,7 @@ impl Collection {
     pub async fn search(
         &self,
         request: SearchRequest,
-        search_runtime_handle: &Handle,
+        read_consistency: Option<ReadConsistency>,
         shard_selection: Option<ShardId>,
     ) -> CollectionResult<Vec<ScoredPoint>> {
         if request.limit == 0 {
@@ -886,7 +971,7 @@ impl Collection {
             searches: vec![request],
         };
         let results = self
-            ._search_batch(request_batch, search_runtime_handle, shard_selection)
+            ._search_batch(request_batch, read_consistency, shard_selection)
             .await?;
         Ok(results.into_iter().next().unwrap())
     }
@@ -894,6 +979,7 @@ impl Collection {
     pub async fn scroll_by(
         &self,
         request: ScrollRequest,
+        read_consistency: Option<ReadConsistency>,
         shard_selection: Option<ShardId>,
     ) -> CollectionResult<ScrollResult> {
         let default_request = ScrollRequest::default();
@@ -926,6 +1012,7 @@ impl Collection {
                     &with_payload_interface,
                     &with_vector,
                     request.filter.as_ref(),
+                    read_consistency,
                 )
             });
 
@@ -975,6 +1062,7 @@ impl Collection {
     pub async fn retrieve(
         &self,
         request: PointRequest,
+        read_consistency: Option<ReadConsistency>,
         shard_selection: Option<ShardId>,
     ) -> CollectionResult<Vec<Record>> {
         let with_payload_interface = request
@@ -986,9 +1074,14 @@ impl Collection {
         let all_shard_collection_results = {
             let shard_holder = self.shards_holder.read().await;
             let target_shards = shard_holder.target_shard(shard_selection)?;
-            let retrieve_futures = target_shards
-                .into_iter()
-                .map(|shard| shard.retrieve(request.clone(), &with_payload, &request.with_vector));
+            let retrieve_futures = target_shards.into_iter().map(|shard| {
+                shard.retrieve(
+                    request.clone(),
+                    &with_payload,
+                    &request.with_vector,
+                    read_consistency,
+                )
+            });
             try_join_all(retrieve_futures).await?
         };
         let points = all_shard_collection_results.into_iter().flatten().collect();
@@ -1000,10 +1093,10 @@ impl Collection {
         params_diff: CollectionParamsDiff,
     ) -> CollectionResult<()> {
         {
-            let mut config = self.config.write().await;
+            let mut config = self.collection_config.write().await;
             config.params = params_diff.update(&config.params)?;
         }
-        self.config.read().await.save(&self.path)?;
+        self.collection_config.read().await.save(&self.path)?;
         Ok(())
     }
 
@@ -1040,18 +1133,14 @@ impl Collection {
                     if !peers.contains_key(&peer_id) {
                         return Err(CollectionError::BadRequest {
                             description: format!(
-                                "Peer {} has no replica of shard {}",
-                                peer_id, shard_id
+                                "Peer {peer_id} has no replica of shard {shard_id}"
                             ),
                         });
                     }
 
                     if peers.len() == 1 {
                         return Err(CollectionError::BadRequest {
-                            description: format!(
-                                "Shard {} must have at least one replica",
-                                shard_id
-                            ),
+                            description: format!("Shard {shard_id} must have at least one replica"),
                         });
                     }
 
@@ -1071,7 +1160,7 @@ impl Collection {
         optimizer_config_diff: OptimizersConfigDiff,
     ) -> CollectionResult<()> {
         {
-            let mut config = self.config.write().await;
+            let mut config = self.collection_config.write().await;
             config.optimizer_config =
                 DiffConfig::update(optimizer_config_diff, &config.optimizer_config)?;
         }
@@ -1081,7 +1170,7 @@ impl Collection {
                 replica_set.on_optimizer_config_update().await?;
             }
         }
-        self.config.read().await.save(&self.path)?;
+        self.collection_config.read().await.save(&self.path)?;
         Ok(())
     }
 
@@ -1094,7 +1183,7 @@ impl Collection {
         optimizer_config: OptimizersConfig,
     ) -> CollectionResult<()> {
         {
-            let mut config = self.config.write().await;
+            let mut config = self.collection_config.write().await;
             config.optimizer_config = optimizer_config;
         }
         {
@@ -1103,7 +1192,7 @@ impl Collection {
                 replica_set.on_optimizer_config_update().await?;
             }
         }
-        self.config.read().await.save(&self.path)?;
+        self.collection_config.read().await.save(&self.path)?;
         Ok(())
     }
 
@@ -1212,7 +1301,7 @@ impl Collection {
         let shards_holder = self.shards_holder.read().await;
         let transfers = shards_holder.shard_transfers.read().clone();
         State {
-            config: self.config.read().await.clone(),
+            config: self.collection_config.read().await.clone(),
             shards: shards_holder
                 .get_shards()
                 .map(|(shard_id, replicas)| {
@@ -1248,7 +1337,7 @@ impl Collection {
         CollectionTelemetry {
             id: self.name(),
             init_time_ms: self.init_time.as_millis() as u64,
-            config: self.config.read().await.clone(),
+            config: self.collection_config.read().await.clone(),
             shards: shards_telemetry,
             transfers,
         }
@@ -1262,7 +1351,7 @@ impl Collection {
         let snapshot_path = self.snapshots_path.join(snapshot_name);
         if !snapshot_path.exists() {
             return Err(CollectionError::NotFound {
-                what: format!("Snapshot {}", snapshot_name),
+                what: format!("Snapshot {snapshot_name}"),
             });
         }
         Ok(snapshot_path)
@@ -1280,11 +1369,15 @@ impl Collection {
             chrono::Utc::now().format("%Y-%m-%d-%H-%M-%S")
         );
         let snapshot_path = self.snapshots_path.join(&snapshot_name);
-
+        log::info!(
+            "Creating collection snapshot {} into {:?}",
+            snapshot_name,
+            snapshot_path
+        );
         let snapshot_path_tmp = snapshot_path.with_extension("tmp");
 
         let snapshot_path_with_tmp_extension = temp_dir.join(&snapshot_name).with_extension("tmp");
-        let snapshot_path_with_arc_extension = temp_dir.join(snapshot_name).with_extension("arc");
+        let snapshot_path_with_arc_extension = temp_dir.join(&snapshot_name).with_extension("arc");
 
         create_dir_all(&snapshot_path_with_tmp_extension).await?;
 
@@ -1300,13 +1393,14 @@ impl Collection {
         }
 
         CollectionVersion::save(&snapshot_path_with_tmp_extension)?;
-        self.config
+        self.collection_config
             .read()
             .await
             .save(&snapshot_path_with_tmp_extension)?;
 
         let snapshot_path_with_arc_extension_clone = snapshot_path_with_arc_extension.clone();
         let snapshot_path_with_tmp_extension_clone = snapshot_path_with_tmp_extension.clone();
+        log::debug!("Archiving snapshot {:?}", snapshot_path_with_tmp_extension);
         let archiving = tokio::task::spawn_blocking(move || {
             // have to use std here, cause TarBuilder is not async
             let file = std::fs::File::create(&snapshot_path_with_arc_extension_clone)?;
@@ -1329,6 +1423,11 @@ impl Collection {
         rename(&snapshot_path_tmp, &snapshot_path).await?;
         remove_file(snapshot_path_with_arc_extension).await?;
 
+        log::info!(
+            "Collection snapshot {} completed into {:?}",
+            snapshot_name,
+            snapshot_path
+        );
         get_snapshot_description(&snapshot_path).await
     }
 
@@ -1350,7 +1449,15 @@ impl Collection {
             .await
     }
 
-    pub fn restore_snapshot(snapshot_path: &Path, target_dir: &Path) -> CollectionResult<()> {
+    /// Restore collection from snapshot
+    ///
+    /// This method performs blocking IO.
+    pub fn restore_snapshot(
+        snapshot_path: &Path,
+        target_dir: &Path,
+        this_peer_id: PeerId,
+        is_distributed: bool,
+    ) -> CollectionResult<()> {
         // decompress archive
         let archive_file = std::fs::File::open(snapshot_path)?;
         let mut ar = tar::Archive::new(archive_file);
@@ -1370,7 +1477,11 @@ impl Collection {
                     }
                     shard_config::ShardType::Temporary => {}
                     shard_config::ShardType::ReplicaSet { .. } => {
-                        ReplicaSetShard::restore_snapshot(&shard_path)?
+                        ReplicaSetShard::restore_snapshot(
+                            &shard_path,
+                            this_peer_id,
+                            is_distributed,
+                        )?
                     }
                 }
             } else {
@@ -1396,6 +1507,10 @@ impl Collection {
     pub async fn sync_local_state(
         &self,
         on_transfer_failure: OnTransferFailure,
+        on_transfer_success: OnTransferSuccess,
+        on_finish_init: ChangePeerState,
+        on_convert_to_listener: ChangePeerState,
+        on_convert_from_listener: ChangePeerState,
     ) -> CollectionResult<()> {
         // Check for disabled replicas
         let shard_holder = self.shards_holder.read().await;
@@ -1407,16 +1522,100 @@ impl Collection {
         let outgoing_transfers = self.get_outgoing_transfers(&self.this_peer_id).await;
         let tasks_lock = self.transfer_tasks.lock().await;
         for transfer in outgoing_transfers {
-            if !tasks_lock.check_if_still_running(&transfer.key()) {
+            match tasks_lock.get_task_result(&transfer.key()) {
+                None => {
+                    if !tasks_lock.check_if_still_running(&transfer.key()) {
+                        log::debug!(
+                            "Transfer {:?} does not exist, but not reported as cancelled. Reporting now.",
+                            transfer.key()
+                        );
+                        on_transfer_failure(transfer, self.name(), "transfer task does not exist");
+                    }
+                }
+                Some(true) => {
+                    log::debug!(
+                        "Transfer {:?} is finished successfully, but not reported. Reporting now.",
+                        transfer.key()
+                    );
+                    on_transfer_success(transfer, self.name());
+                }
+                Some(false) => {
+                    log::debug!(
+                        "Transfer {:?} is failed, but not reported as failed. Reporting now.",
+                        transfer.key()
+                    );
+                    on_transfer_failure(transfer, self.name(), "transfer task does not exist");
+                }
+            }
+        }
+
+        // Check for proper replica states
+        for replica_set in shard_holder.all_shards() {
+            let this_peer_id = &replica_set.this_peer_id();
+            let shard_id = replica_set.shard_id;
+
+            let peers = replica_set.peers();
+            let this_peer_state = peers.get(this_peer_id).copied();
+            let is_last_active = peers.values().filter(|state| **state == Active).count() == 1;
+
+            if this_peer_state == Some(Initializing) {
+                // It is possible, that collection creation didn't report
+                // Try to activate shard, as the collection clearly exists
+                on_finish_init(*this_peer_id, shard_id);
+                continue;
+            }
+
+            if self.shared_storage_config.node_type == NodeType::Listener {
+                if this_peer_state == Some(Active) && !is_last_active {
+                    // Convert active node from active to listener
+                    on_convert_to_listener(*this_peer_id, shard_id);
+                    continue;
+                }
+            } else if this_peer_state == Some(Listener) {
+                // Convert listener node to active
+                on_convert_from_listener(*this_peer_id, shard_id);
+                continue;
+            }
+
+            if this_peer_state != Some(Dead) {
+                continue; // All good
+            }
+
+            // Try to find dead replicas with no active transfers
+            let transfers = self.get_transfers(|_| true).await;
+
+            // Try to find a replica to transfer from
+            for replica_id in replica_set.active_remote_shards().await {
+                let transfer = ShardTransfer {
+                    from: replica_id,
+                    to: *this_peer_id,
+                    shard_id,
+                    sync: true,
+                };
+                if check_transfer_conflicts(&transfer, transfers.iter()).is_some() {
+                    continue; // this transfer won't work
+                }
                 log::debug!(
-                    "Transfer {:?} is not running, but not reported as finished. Reporting now.",
-                    transfer.key()
+                    "Recovering shard {}:{} on peer {} by requesting it from {}",
+                    self.name(),
+                    shard_id,
+                    this_peer_id,
+                    replica_id
                 );
-                on_transfer_failure(transfer, self.name(), "transfer task does not exist");
+                self.request_shard_transfer(transfer);
+                break;
             }
         }
 
         Ok(())
+    }
+
+    pub fn wait_collection_initiated(&self, timeout: Duration) -> bool {
+        self.is_initialized.await_ready_for_timeout(timeout)
+    }
+
+    pub async fn lock_updates(&self) -> RwLockWriteGuard<()> {
+        self.updates_lock.write().await
     }
 }
 

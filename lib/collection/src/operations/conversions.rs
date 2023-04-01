@@ -15,15 +15,78 @@ use crate::config::{
 use crate::operations::config_diff::{HnswConfigDiff, OptimizersConfigDiff, WalConfigDiff};
 use crate::operations::point_ops::PointsSelector::PointIdsSelector;
 use crate::operations::point_ops::{
-    Batch, FilterSelector, PointIdsList, PointStruct, PointsSelector,
+    Batch, FilterSelector, PointIdsList, PointStruct, PointsSelector, WriteOrdering,
 };
 use crate::operations::types::{
-    CollectionInfo, CollectionStatus, CountResult, LookupLocation, OptimizersStatus,
-    RecommendRequest, Record, SearchRequest, UpdateResult, UpdateStatus, VectorParams,
-    VectorsConfig,
+    AliasDescription, CollectionInfo, CollectionStatus, CountResult, LookupLocation,
+    OptimizersStatus, RecommendRequest, Record, SearchRequest, UpdateResult, UpdateStatus,
+    VectorParams, VectorsConfig,
 };
 use crate::optimizers_builder::OptimizersConfig;
 use crate::shards::remote_shard::CollectionSearchRequest;
+
+pub fn write_ordering_to_proto(ordering: WriteOrdering) -> api::grpc::qdrant::WriteOrdering {
+    api::grpc::qdrant::WriteOrdering {
+        r#type: match ordering {
+            WriteOrdering::Weak => api::grpc::qdrant::WriteOrderingType::Weak as i32,
+            WriteOrdering::Medium => api::grpc::qdrant::WriteOrderingType::Medium as i32,
+            WriteOrdering::Strong => api::grpc::qdrant::WriteOrderingType::Strong as i32,
+        },
+    }
+}
+
+pub fn write_ordering_from_proto(
+    ordering: Option<api::grpc::qdrant::WriteOrdering>,
+) -> Result<WriteOrdering, Status> {
+    let ordering_parsed = match ordering {
+        None => api::grpc::qdrant::WriteOrderingType::Weak,
+        Some(write_ordering) => {
+            match api::grpc::qdrant::WriteOrderingType::from_i32(write_ordering.r#type) {
+                None => {
+                    return Err(Status::invalid_argument(format!(
+                        "cannot convert ordering: {}",
+                        write_ordering.r#type
+                    )))
+                }
+                Some(res) => res,
+            }
+        }
+    };
+
+    Ok(match ordering_parsed {
+        api::grpc::qdrant::WriteOrderingType::Weak => WriteOrdering::Weak,
+        api::grpc::qdrant::WriteOrderingType::Medium => WriteOrdering::Medium,
+        api::grpc::qdrant::WriteOrderingType::Strong => WriteOrdering::Strong,
+    })
+}
+
+pub fn try_record_from_grpc(
+    point: api::grpc::qdrant::RetrievedPoint,
+    with_payload: bool,
+) -> Result<Record, tonic::Status> {
+    let id = point
+        .id
+        .ok_or_else(|| tonic::Status::invalid_argument("retrieved point does not have an ID"))?
+        .try_into()?;
+
+    let payload = if with_payload {
+        Some(api::grpc::conversions::proto_to_payloads(point.payload)?)
+    } else {
+        debug_assert!(point.payload.is_empty());
+        None
+    };
+
+    let vector = point
+        .vectors
+        .map(|vectors| vectors.try_into())
+        .transpose()?;
+
+    Ok(Record {
+        id,
+        payload,
+        vector,
+    })
+}
 
 impl From<api::grpc::qdrant::HnswConfigDiff> for HnswConfigDiff {
     fn from(value: api::grpc::qdrant::HnswConfigDiff) -> Self {
@@ -176,6 +239,7 @@ impl From<CollectionInfo> for api::grpc::qdrant::CollectionInfo {
                     wal_capacity_mb: Some(config.wal_config.wal_capacity_mb as u64),
                     wal_segments_ahead: Some(config.wal_config.wal_segments_ahead as u64),
                 }),
+                quantization_config: config.quantization_config.map(|x| x.into()),
             }),
             payload_schema: payload_schema
                 .into_iter()
@@ -194,23 +258,6 @@ impl From<Record> for api::grpc::qdrant::RetrievedPoint {
             payload: record.payload.map(payload_to_proto).unwrap_or_default(),
             vectors,
         }
-    }
-}
-
-impl TryFrom<api::grpc::qdrant::RetrievedPoint> for Record {
-    type Error = Status;
-
-    fn try_from(retrieved_point: api::grpc::qdrant::RetrievedPoint) -> Result<Self, Self::Error> {
-        let vectors = match retrieved_point.vectors {
-            None => None,
-            Some(vectors) => Some(vectors.try_into()?),
-        };
-
-        Ok(Self {
-            id: retrieved_point.id.unwrap().try_into()?,
-            payload: Some(proto_to_payloads(retrieved_point.payload)?),
-            vector: vectors,
-        })
     }
 }
 
@@ -335,6 +382,13 @@ impl TryFrom<api::grpc::qdrant::CollectionConfig> for CollectionConfig {
             wal_config: match config.wal_config {
                 None => return Err(Status::invalid_argument("Malformed WalConfig type")),
                 Some(wal_config) => wal_config.into(),
+            },
+            quantization_config: {
+                if let Some(config) = config.quantization_config {
+                    Some(config.try_into()?)
+                } else {
+                    None
+                }
             },
         })
     }
@@ -550,6 +604,7 @@ impl<'a> From<CollectionSearchRequest<'a>> for api::grpc::qdrant::SearchPoints {
                 DEFAULT_VECTOR_NAME => None,
                 vector_name => Some(vector_name.to_string()),
             },
+            read_consistency: None,
         }
     }
 }
@@ -635,6 +690,15 @@ impl From<VectorParams> for api::grpc::qdrant::VectorParams {
                 Distance::Dot => api::grpc::qdrant::Distance::Dot,
             }
             .into(),
+        }
+    }
+}
+
+impl From<AliasDescription> for api::grpc::qdrant::AliasDescription {
+    fn from(value: AliasDescription) -> Self {
+        api::grpc::qdrant::AliasDescription {
+            alias_name: value.alias_name,
+            collection_name: value.collection_name,
         }
     }
 }

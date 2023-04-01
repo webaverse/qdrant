@@ -1,7 +1,7 @@
 use std::collections::HashMap;
-use std::fs::{create_dir_all, File};
+use std::fs::File;
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use atomic_refcell::AtomicRefCell;
@@ -20,7 +20,7 @@ use crate::index::hnsw_index::graph_links::{GraphLinksMmap, GraphLinksRam};
 use crate::index::hnsw_index::hnsw::HNSWIndex;
 use crate::index::plain_payload_index::PlainIndex;
 use crate::index::struct_payload_index::StructPayloadIndex;
-use crate::index::VectorIndexSS;
+use crate::index::VectorIndexEnum;
 use crate::payload_storage::on_disk_payload_storage::OnDiskPayloadStorage;
 use crate::payload_storage::simple_payload_storage::SimplePayloadStorage;
 use crate::segment::{Segment, SegmentVersion, VectorData, SEGMENT_STATE_FILE};
@@ -30,10 +30,33 @@ use crate::types::{
 };
 use crate::vector_storage::memmap_vector_storage::open_memmap_vector_storage;
 use crate::vector_storage::simple_vector_storage::open_simple_vector_storage;
-use crate::vector_storage::VectorStorageSS;
+use crate::vector_storage::VectorStorage;
+
+pub const PAYLOAD_INDEX_PATH: &str = "payload_index";
+pub const VECTOR_STORAGE_PATH: &str = "vector_storage";
+pub const VECTOR_INDEX_PATH: &str = "vector_index";
 
 fn sp<T>(t: T) -> Arc<AtomicRefCell<T>> {
     Arc::new(AtomicRefCell::new(t))
+}
+
+fn get_vector_name_with_prefix(prefix: &str, vector_name: &str) -> String {
+    if !vector_name.is_empty() {
+        format!("{prefix}-{vector_name}")
+    } else {
+        prefix.to_owned()
+    }
+}
+
+pub fn get_vector_storage_path(segment_path: &Path, vector_name: &str) -> PathBuf {
+    segment_path.join(get_vector_name_with_prefix(
+        VECTOR_STORAGE_PATH,
+        vector_name,
+    ))
+}
+
+pub fn get_vector_index_path(segment_path: &Path, vector_name: &str) -> PathBuf {
+    segment_path.join(get_vector_name_with_prefix(VECTOR_INDEX_PATH, vector_name))
 }
 
 fn create_segment(
@@ -41,20 +64,13 @@ fn create_segment(
     segment_path: &Path,
     config: &SegmentConfig,
 ) -> OperationResult<Segment> {
-    let get_vector_name_with_prefix = |prefix: &str, vector_name: &str| {
-        if !vector_name.is_empty() {
-            format!("{}-{}", prefix, vector_name)
-        } else {
-            prefix.to_owned()
-        }
-    };
     let vector_db_names: Vec<String> = config
         .vector_data
         .keys()
         .map(|vector_name| get_vector_name_with_prefix(DB_VECTOR_CF, vector_name))
         .collect();
     let database = open_db(segment_path, &vector_db_names)
-        .map_err(|err| OperationError::service_error(format!("RocksDB open error: {}", err)))?;
+        .map_err(|err| OperationError::service_error(format!("RocksDB open error: {err}")))?;
 
     let payload_storage = match config.payload_storage_type {
         PayloadStorageType::InMemory => sp(SimplePayloadStorage::open(database.clone())?.into()),
@@ -63,7 +79,7 @@ fn create_segment(
 
     let id_tracker = sp(SimpleIdTracker::open(database.clone())?);
 
-    let payload_index_path = segment_path.join("payload_index");
+    let payload_index_path = segment_path.join(PAYLOAD_INDEX_PATH);
     let payload_index: Arc<AtomicRefCell<StructPayloadIndex>> = sp(StructPayloadIndex::open(
         payload_storage,
         id_tracker.clone(),
@@ -72,12 +88,10 @@ fn create_segment(
 
     let mut vector_data = HashMap::new();
     for (vector_name, vector_config) in &config.vector_data {
-        let vector_storage_path =
-            segment_path.join(get_vector_name_with_prefix("vector_storage", vector_name));
-        let vector_index_path =
-            segment_path.join(get_vector_name_with_prefix("vector_index", vector_name));
+        let vector_storage_path = get_vector_storage_path(segment_path, vector_name);
+        let vector_index_path = get_vector_index_path(segment_path, vector_name);
 
-        let vector_storage: Arc<AtomicRefCell<VectorStorageSS>> = match config.storage_type {
+        let vector_storage = match config.storage_type {
             StorageType::InMemory => {
                 let db_column_name = get_vector_name_with_prefix(DB_VECTOR_CF, vector_name);
                 open_simple_vector_storage(
@@ -94,26 +108,40 @@ fn create_segment(
             )?,
         };
 
-        let vector_index: Arc<AtomicRefCell<VectorIndexSS>> = match config.index {
-            Indexes::Plain { .. } => sp(PlainIndex::new(
+        if config.quantization_config.is_some() {
+            let quantized_data_path = vector_storage_path;
+            // Try to load quantization data from disk, if exists
+            // If not exists or it's a new segment, just ignore it
+            vector_storage
+                .borrow_mut()
+                .load_quantization(&quantized_data_path)?;
+        }
+
+        let vector_index: Arc<AtomicRefCell<VectorIndexEnum>> = match config.index {
+            Indexes::Plain { .. } => sp(VectorIndexEnum::Plain(PlainIndex::new(
+                id_tracker.clone(),
                 vector_storage.clone(),
                 payload_index.clone(),
-            )),
+            ))),
             Indexes::Hnsw(hnsw_config) => {
                 if hnsw_config.on_disk.unwrap_or(false) {
-                    sp(HNSWIndex::<GraphLinksMmap>::open(
-                        &vector_index_path,
-                        vector_storage.clone(),
-                        payload_index.clone(),
-                        hnsw_config,
-                    )?)
+                    sp(VectorIndexEnum::HnswMmap(
+                        HNSWIndex::<GraphLinksMmap>::open(
+                            &vector_index_path,
+                            id_tracker.clone(),
+                            vector_storage.clone(),
+                            payload_index.clone(),
+                            hnsw_config,
+                        )?,
+                    ))
                 } else {
-                    sp(HNSWIndex::<GraphLinksRam>::open(
+                    sp(VectorIndexEnum::HnswRam(HNSWIndex::<GraphLinksRam>::open(
                         &vector_index_path,
+                        id_tracker.clone(),
                         vector_storage.clone(),
                         payload_index.clone(),
                         hnsw_config,
-                    )?)
+                    )?))
                 }
             }
         };
@@ -170,16 +198,14 @@ pub fn load_segment(path: &Path) -> OperationResult<Option<Segment>> {
 
         if stored_version > app_version {
             return Err(OperationError::service_error(format!(
-                "Data version {} is newer than application version {}. \
-                Please upgrade the application. Compatibility is not guaranteed.",
-                stored_version, app_version
+                "Data version {stored_version} is newer than application version {app_version}. \
+                Please upgrade the application. Compatibility is not guaranteed."
             )));
         }
 
         if stored_version.major == 0 && stored_version.minor < 3 {
             return Err(OperationError::service_error(format!(
-                "Segment version({}) is not compatible with current version({})",
-                stored_version, app_version
+                "Segment version({stored_version}) is not compatible with current version({app_version})"
             )));
         }
 
@@ -193,10 +219,7 @@ pub fn load_segment(path: &Path) -> OperationResult<Option<Segment>> {
 
     let segment_state = Segment::load_state(path)?;
 
-    let mut segment = create_segment(segment_state.version, path, &segment_state.config)?;
-
-    info!("Checking segment consistency: {}", path.display());
-    segment.check_consistency_and_repair()?;
+    let segment = create_segment(segment_state.version, path, &segment_state.config)?;
 
     Ok(Some(segment))
 }
@@ -213,7 +236,7 @@ pub fn load_segment(path: &Path) -> OperationResult<Option<Segment>> {
 pub fn build_segment(path: &Path, config: &SegmentConfig) -> OperationResult<Segment> {
     let segment_path = path.join(Uuid::new_v4().to_string());
 
-    create_dir_all(&segment_path)?;
+    std::fs::create_dir_all(&segment_path)?;
 
     let segment = create_segment(0, &segment_path, config)?;
     segment.save_current_state()?;
@@ -269,6 +292,7 @@ fn load_segment_state_v3(segment_path: &Path) -> OperationResult<SegmentState> {
                     index: state.config.index,
                     storage_type: state.config.storage_type,
                     payload_storage_type: state.config.payload_storage_type,
+                    quantization_config: None,
                 },
             }
         })

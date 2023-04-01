@@ -66,7 +66,7 @@ impl PayloadStorage for PayloadStorageEnum {
         &mut self,
         point_id: PointOffsetType,
         key: PayloadKeyTypeRef,
-    ) -> OperationResult<Option<Value>> {
+    ) -> OperationResult<Vec<Value>> {
         match self {
             PayloadStorageEnum::InMemoryPayloadStorage(s) => s.delete(point_id, key),
             PayloadStorageEnum::SimplePayloadStorage(s) => s.delete(point_id, key),
@@ -170,7 +170,7 @@ mod tests {
             assert!(res.0.contains_key("location"));
             assert!(res.0.contains_key("name"));
 
-            eprintln!("res = {:#?}", res);
+            eprintln!("res = {res:#?}");
 
             let partial_payload: Payload =
                 serde_json::from_str(r#"{ "hobby": "vector search" }"#).unwrap();
@@ -185,7 +185,7 @@ mod tests {
             assert!(res.0.contains_key("hobby"));
             assert!(res.0.contains_key("name"));
 
-            eprintln!("res = {:#?}", res);
+            eprintln!("res = {res:#?}");
         }
     }
 }

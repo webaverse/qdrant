@@ -191,7 +191,7 @@ mod tests {
         };
         let raw_cbor = serde_cbor::to_vec(&obj1).unwrap();
         let obj2 = serde_cbor::from_slice::<TextSelectorOpt>(&raw_cbor).unwrap();
-        eprintln!("obj2 = {:#?}", obj2);
+        eprintln!("obj2 = {obj2:#?}");
         assert_eq!(obj1.points, obj2.points.unwrap());
     }
 
@@ -219,14 +219,18 @@ mod tests {
 
                 assert!(payload.contains_key("key1"));
 
-                let payload_type = payload.get_value("key1").expect("No key key1");
+                let payload_type = payload
+                    .get_value("key1")
+                    .next()
+                    .cloned()
+                    .expect("No key key1");
 
                 match payload_type {
                     Value::String(x) => assert_eq!(x, "hello"),
                     _ => panic!("Wrong payload type"),
                 }
 
-                let payload_type_json = payload.get_value("key3");
+                let payload_type_json = payload.get_value("key3").next().cloned();
 
                 assert!(matches!(payload_type_json, Some(Value::Object(_))))
             }

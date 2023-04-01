@@ -171,6 +171,34 @@ pub struct OptimizersConfigDiff {
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ScalarQuantization {
+    /// Type of quantization
+    #[prost(enumeration = "QuantizationType", tag = "1")]
+    pub r#type: i32,
+    /// Number of bits to use for quantization
+    #[prost(float, optional, tag = "2")]
+    pub quantile: ::core::option::Option<f32>,
+    /// If true - quantized vectors always will be stored in RAM, ignoring the config of main storage
+    #[prost(bool, optional, tag = "3")]
+    pub always_ram: ::core::option::Option<bool>,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct QuantizationConfig {
+    #[prost(oneof = "quantization_config::Quantization", tags = "1")]
+    pub quantization: ::core::option::Option<quantization_config::Quantization>,
+}
+/// Nested message and enum types in `QuantizationConfig`.
+pub mod quantization_config {
+    #[allow(clippy::derive_partial_eq_without_eq)]
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Quantization {
+        #[prost(message, tag = "1")]
+        Scalar(super::ScalarQuantization),
+    }
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct CreateCollection {
     /// Name of the collection
     #[prost(string, tag = "1")]
@@ -202,6 +230,11 @@ pub struct CreateCollection {
     /// How many replicas should apply the operation for us to consider it successful, default = 1
     #[prost(uint32, optional, tag = "12")]
     pub write_consistency_factor: ::core::option::Option<u32>,
+    /// Specify name of the other collection to copy data from
+    #[prost(string, optional, tag = "13")]
+    pub init_from_collection: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(message, optional, tag = "14")]
+    pub quantization_config: ::core::option::Option<QuantizationConfig>,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -283,6 +316,9 @@ pub struct CollectionConfig {
     /// Configuration of the Write-Ahead-Log
     #[prost(message, optional, tag = "4")]
     pub wal_config: ::core::option::Option<WalConfigDiff>,
+    /// Configuration of the vector quantization
+    #[prost(message, optional, tag = "5")]
+    pub quantization_config: ::core::option::Option<QuantizationConfig>,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -416,6 +452,35 @@ pub struct DeleteAlias {
     #[prost(string, tag = "1")]
     pub alias_name: ::prost::alloc::string::String,
 }
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListAliasesRequest {}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListCollectionAliasesRequest {
+    /// Name of the collection
+    #[prost(string, tag = "1")]
+    pub collection_name: ::prost::alloc::string::String,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AliasDescription {
+    /// Name of the alias
+    #[prost(string, tag = "1")]
+    pub alias_name: ::prost::alloc::string::String,
+    /// Name of the collection
+    #[prost(string, tag = "2")]
+    pub collection_name: ::prost::alloc::string::String,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListAliasesResponse {
+    #[prost(message, repeated, tag = "1")]
+    pub aliases: ::prost::alloc::vec::Vec<AliasDescription>,
+    /// Time spent to process
+    #[prost(double, tag = "2")]
+    pub time: f64,
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum Distance {
@@ -486,6 +551,24 @@ impl PayloadSchemaType {
             PayloadSchemaType::Float => "Float",
             PayloadSchemaType::Geo => "Geo",
             PayloadSchemaType::Text => "Text",
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum QuantizationType {
+    UnknownQuantization = 0,
+    Int8 = 1,
+}
+impl QuantizationType {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            QuantizationType::UnknownQuantization => "UnknownQuantization",
+            QuantizationType::Int8 => "Int8",
         }
     }
 }
@@ -702,6 +785,48 @@ pub mod collections_client {
             );
             self.inner.unary(request.into_request(), path, codec).await
         }
+        ///
+        /// Get list of all aliases for a collection
+        pub async fn list_collection_aliases(
+            &mut self,
+            request: impl tonic::IntoRequest<super::ListCollectionAliasesRequest>,
+        ) -> Result<tonic::Response<super::ListAliasesResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::new(
+                        tonic::Code::Unknown,
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/qdrant.Collections/ListCollectionAliases",
+            );
+            self.inner.unary(request.into_request(), path, codec).await
+        }
+        ///
+        /// Get list of all aliases for all existing collections
+        pub async fn list_aliases(
+            &mut self,
+            request: impl tonic::IntoRequest<super::ListAliasesRequest>,
+        ) -> Result<tonic::Response<super::ListAliasesResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::new(
+                        tonic::Code::Unknown,
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/qdrant.Collections/ListAliases",
+            );
+            self.inner.unary(request.into_request(), path, codec).await
+        }
     }
 }
 /// Generated server implementations.
@@ -747,6 +872,18 @@ pub mod collections_server {
             &self,
             request: tonic::Request<super::ChangeAliases>,
         ) -> Result<tonic::Response<super::CollectionOperationResponse>, tonic::Status>;
+        ///
+        /// Get list of all aliases for a collection
+        async fn list_collection_aliases(
+            &self,
+            request: tonic::Request<super::ListCollectionAliasesRequest>,
+        ) -> Result<tonic::Response<super::ListAliasesResponse>, tonic::Status>;
+        ///
+        /// Get list of all aliases for all existing collections
+        async fn list_aliases(
+            &self,
+            request: tonic::Request<super::ListAliasesRequest>,
+        ) -> Result<tonic::Response<super::ListAliasesResponse>, tonic::Status>;
     }
     #[derive(Debug)]
     pub struct CollectionsServer<T: Collections> {
@@ -1026,6 +1163,86 @@ pub mod collections_server {
                     let fut = async move {
                         let inner = inner.0;
                         let method = UpdateAliasesSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/qdrant.Collections/ListCollectionAliases" => {
+                    #[allow(non_camel_case_types)]
+                    struct ListCollectionAliasesSvc<T: Collections>(pub Arc<T>);
+                    impl<
+                        T: Collections,
+                    > tonic::server::UnaryService<super::ListCollectionAliasesRequest>
+                    for ListCollectionAliasesSvc<T> {
+                        type Response = super::ListAliasesResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::ListCollectionAliasesRequest>,
+                        ) -> Self::Future {
+                            let inner = self.0.clone();
+                            let fut = async move {
+                                (*inner).list_collection_aliases(request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let inner = inner.0;
+                        let method = ListCollectionAliasesSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/qdrant.Collections/ListAliases" => {
+                    #[allow(non_camel_case_types)]
+                    struct ListAliasesSvc<T: Collections>(pub Arc<T>);
+                    impl<
+                        T: Collections,
+                    > tonic::server::UnaryService<super::ListAliasesRequest>
+                    for ListAliasesSvc<T> {
+                        type Response = super::ListAliasesResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::ListAliasesRequest>,
+                        ) -> Self::Future {
+                            let inner = self.0.clone();
+                            let fut = async move {
+                                (*inner).list_aliases(request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let inner = inner.0;
+                        let method = ListAliasesSvc(inner);
                         let codec = tonic::codec::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(
@@ -1495,6 +1712,32 @@ impl NullValue {
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
+pub struct WriteOrdering {
+    /// Write ordering guarantees
+    #[prost(enumeration = "WriteOrderingType", tag = "1")]
+    pub r#type: i32,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ReadConsistency {
+    #[prost(oneof = "read_consistency::Value", tags = "1, 2")]
+    pub value: ::core::option::Option<read_consistency::Value>,
+}
+/// Nested message and enum types in `ReadConsistency`.
+pub mod read_consistency {
+    #[allow(clippy::derive_partial_eq_without_eq)]
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Value {
+        /// Common read consistency configurations
+        #[prost(enumeration = "super::ReadConsistencyType", tag = "1")]
+        Type(i32),
+        /// Send request to a specified number of nodes, and return points which are present on all of them
+        #[prost(uint64, tag = "2")]
+        Factor(u64),
+    }
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct PointId {
     #[prost(oneof = "point_id::PointIdOptions", tags = "1, 2")]
     pub point_id_options: ::core::option::Option<point_id::PointIdOptions>,
@@ -1529,6 +1772,9 @@ pub struct UpsertPoints {
     pub wait: ::core::option::Option<bool>,
     #[prost(message, repeated, tag = "3")]
     pub points: ::prost::alloc::vec::Vec<PointStruct>,
+    /// Write ordering guarantees
+    #[prost(message, optional, tag = "4")]
+    pub ordering: ::core::option::Option<WriteOrdering>,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -1542,6 +1788,9 @@ pub struct DeletePoints {
     /// Affected points
     #[prost(message, optional, tag = "3")]
     pub points: ::core::option::Option<PointsSelector>,
+    /// Write ordering guarantees
+    #[prost(message, optional, tag = "4")]
+    pub ordering: ::core::option::Option<WriteOrdering>,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -1558,6 +1807,9 @@ pub struct GetPoints {
     /// Options for specifying which vectors to include into response
     #[prost(message, optional, tag = "5")]
     pub with_vectors: ::core::option::Option<WithVectorsSelector>,
+    /// Options for specifying read consistency guarantees
+    #[prost(message, optional, tag = "6")]
+    pub read_consistency: ::core::option::Option<ReadConsistency>,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -1571,12 +1823,12 @@ pub struct SetPayloadPoints {
     /// New payload values
     #[prost(map = "string, message", tag = "3")]
     pub payload: ::std::collections::HashMap<::prost::alloc::string::String, Value>,
-    /// List of point to modify, deprecated
-    #[prost(message, repeated, tag = "4")]
-    pub points: ::prost::alloc::vec::Vec<PointId>,
     /// Affected points
     #[prost(message, optional, tag = "5")]
     pub points_selector: ::core::option::Option<PointsSelector>,
+    /// Write ordering guarantees
+    #[prost(message, optional, tag = "6")]
+    pub ordering: ::core::option::Option<WriteOrdering>,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -1590,12 +1842,12 @@ pub struct DeletePayloadPoints {
     /// List of keys to delete
     #[prost(string, repeated, tag = "3")]
     pub keys: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-    /// Affected points, deprecated
-    #[prost(message, repeated, tag = "4")]
-    pub points: ::prost::alloc::vec::Vec<PointId>,
     /// Affected points
     #[prost(message, optional, tag = "5")]
     pub points_selector: ::core::option::Option<PointsSelector>,
+    /// Write ordering guarantees
+    #[prost(message, optional, tag = "6")]
+    pub ordering: ::core::option::Option<WriteOrdering>,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -1609,6 +1861,9 @@ pub struct ClearPayloadPoints {
     /// Affected points
     #[prost(message, optional, tag = "3")]
     pub points: ::core::option::Option<PointsSelector>,
+    /// Write ordering guarantees
+    #[prost(message, optional, tag = "4")]
+    pub ordering: ::core::option::Option<WriteOrdering>,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -1628,6 +1883,9 @@ pub struct CreateFieldIndexCollection {
     /// Payload index params.
     #[prost(message, optional, tag = "5")]
     pub field_index_params: ::core::option::Option<PayloadIndexParams>,
+    /// Write ordering guarantees
+    #[prost(message, optional, tag = "6")]
+    pub ordering: ::core::option::Option<WriteOrdering>,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -1641,6 +1899,9 @@ pub struct DeleteFieldIndexCollection {
     /// Field name to delete
     #[prost(string, tag = "3")]
     pub field_name: ::prost::alloc::string::String,
+    /// Write ordering guarantees
+    #[prost(message, optional, tag = "4")]
+    pub ordering: ::core::option::Option<WriteOrdering>,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -1727,6 +1988,18 @@ pub mod with_vectors_selector {
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
+pub struct QuantizationSearchParams {
+    ///
+    /// If set to true, search will ignore quantized vector data
+    #[prost(bool, optional, tag = "1")]
+    pub ignore: ::core::option::Option<bool>,
+    ///
+    /// If true, use original vectors to re-score top-k results. Default is true.
+    #[prost(bool, optional, tag = "2")]
+    pub rescore: ::core::option::Option<bool>,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct SearchParams {
     ///
     /// Params relevant to HNSW index. Size of the beam in a beam-search.
@@ -1737,6 +2010,10 @@ pub struct SearchParams {
     /// Search without approximation. If set to true, search may run long but with exact results.
     #[prost(bool, optional, tag = "2")]
     pub exact: ::core::option::Option<bool>,
+    ///
+    /// If set to true, search will ignore quantized vector data
+    #[prost(message, optional, tag = "3")]
+    pub quantization: ::core::option::Option<QuantizationSearchParams>,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -1771,6 +2048,9 @@ pub struct SearchPoints {
     /// Options for specifying which vectors to include into response
     #[prost(message, optional, tag = "11")]
     pub with_vectors: ::core::option::Option<WithVectorsSelector>,
+    /// Options for specifying read consistency guarantees
+    #[prost(message, optional, tag = "12")]
+    pub read_consistency: ::core::option::Option<ReadConsistency>,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -1780,6 +2060,9 @@ pub struct SearchBatchPoints {
     pub collection_name: ::prost::alloc::string::String,
     #[prost(message, repeated, tag = "2")]
     pub search_points: ::prost::alloc::vec::Vec<SearchPoints>,
+    /// Options for specifying read consistency guarantees
+    #[prost(message, optional, tag = "3")]
+    pub read_consistency: ::core::option::Option<ReadConsistency>,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -1801,6 +2084,9 @@ pub struct ScrollPoints {
     /// Options for specifying which vectors to include into response
     #[prost(message, optional, tag = "7")]
     pub with_vectors: ::core::option::Option<WithVectorsSelector>,
+    /// Options for specifying read consistency guarantees
+    #[prost(message, optional, tag = "8")]
+    pub read_consistency: ::core::option::Option<ReadConsistency>,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -1850,6 +2136,9 @@ pub struct RecommendPoints {
     /// Name of the collection to use for points lookup, if not specified - use current collection
     #[prost(message, optional, tag = "13")]
     pub lookup_from: ::core::option::Option<LookupLocation>,
+    /// Options for specifying read consistency guarantees
+    #[prost(message, optional, tag = "14")]
+    pub read_consistency: ::core::option::Option<ReadConsistency>,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -1859,6 +2148,9 @@ pub struct RecommendBatchPoints {
     pub collection_name: ::prost::alloc::string::String,
     #[prost(message, repeated, tag = "2")]
     pub recommend_points: ::prost::alloc::vec::Vec<RecommendPoints>,
+    /// Options for specifying read consistency guarantees
+    #[prost(message, optional, tag = "3")]
+    pub read_consistency: ::core::option::Option<ReadConsistency>,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -2069,7 +2361,7 @@ pub struct FieldCondition {
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct Match {
-    #[prost(oneof = "r#match::MatchValue", tags = "1, 2, 3, 4")]
+    #[prost(oneof = "r#match::MatchValue", tags = "1, 2, 3, 4, 5, 6")]
     pub match_value: ::core::option::Option<r#match::MatchValue>,
 }
 /// Nested message and enum types in `Match`.
@@ -2089,7 +2381,25 @@ pub mod r#match {
         /// Match text
         #[prost(string, tag = "4")]
         Text(::prost::alloc::string::String),
+        /// Match multiple keywords
+        #[prost(message, tag = "5")]
+        Keywords(super::RepeatedStrings),
+        /// Match multiple integers
+        #[prost(message, tag = "6")]
+        Integers(super::RepeatedIntegers),
     }
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RepeatedStrings {
+    #[prost(string, repeated, tag = "1")]
+    pub strings: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RepeatedIntegers {
+    #[prost(int64, repeated, tag = "1")]
+    pub integers: ::prost::alloc::vec::Vec<i64>,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -2177,6 +2487,52 @@ pub struct GeoPoint {
     pub lon: f64,
     #[prost(double, tag = "2")]
     pub lat: f64,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum WriteOrderingType {
+    /// Write operations may be reordered, works faster, default
+    Weak = 0,
+    /// Write operations go through dynamically selected leader, may be inconsistent for a short period of time in case of leader change
+    Medium = 1,
+    /// Write operations go through the permanent leader, consistent, but may be unavailable if leader is down
+    Strong = 2,
+}
+impl WriteOrderingType {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            WriteOrderingType::Weak => "Weak",
+            WriteOrderingType::Medium => "Medium",
+            WriteOrderingType::Strong => "Strong",
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum ReadConsistencyType {
+    /// Send request to all nodes and return points which are present on all of them
+    All = 0,
+    /// Send requests to all nodes and return points which are present on majority of them
+    Majority = 1,
+    /// Send requests to half + 1 nodes, return points which are present on all of them
+    Quorum = 2,
+}
+impl ReadConsistencyType {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            ReadConsistencyType::All => "All",
+            ReadConsistencyType::Majority => "Majority",
+            ReadConsistencyType::Quorum => "Quorum",
+        }
+    }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
@@ -3371,54 +3727,56 @@ pub struct SyncPoints {
     /// End of the sync range
     #[prost(message, optional, tag = "5")]
     pub to_id: ::core::option::Option<PointId>,
+    #[prost(message, optional, tag = "6")]
+    pub ordering: ::core::option::Option<WriteOrdering>,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct SyncPointsInternal {
     #[prost(message, optional, tag = "1")]
     pub sync_points: ::core::option::Option<SyncPoints>,
-    #[prost(uint32, tag = "2")]
-    pub shard_id: u32,
+    #[prost(uint32, optional, tag = "2")]
+    pub shard_id: ::core::option::Option<u32>,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct UpsertPointsInternal {
     #[prost(message, optional, tag = "1")]
     pub upsert_points: ::core::option::Option<UpsertPoints>,
-    #[prost(uint32, tag = "2")]
-    pub shard_id: u32,
+    #[prost(uint32, optional, tag = "2")]
+    pub shard_id: ::core::option::Option<u32>,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct DeletePointsInternal {
     #[prost(message, optional, tag = "1")]
     pub delete_points: ::core::option::Option<DeletePoints>,
-    #[prost(uint32, tag = "2")]
-    pub shard_id: u32,
+    #[prost(uint32, optional, tag = "2")]
+    pub shard_id: ::core::option::Option<u32>,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct SetPayloadPointsInternal {
     #[prost(message, optional, tag = "1")]
     pub set_payload_points: ::core::option::Option<SetPayloadPoints>,
-    #[prost(uint32, tag = "2")]
-    pub shard_id: u32,
+    #[prost(uint32, optional, tag = "2")]
+    pub shard_id: ::core::option::Option<u32>,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct DeletePayloadPointsInternal {
     #[prost(message, optional, tag = "1")]
     pub delete_payload_points: ::core::option::Option<DeletePayloadPoints>,
-    #[prost(uint32, tag = "2")]
-    pub shard_id: u32,
+    #[prost(uint32, optional, tag = "2")]
+    pub shard_id: ::core::option::Option<u32>,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ClearPayloadPointsInternal {
     #[prost(message, optional, tag = "1")]
     pub clear_payload_points: ::core::option::Option<ClearPayloadPoints>,
-    #[prost(uint32, tag = "2")]
-    pub shard_id: u32,
+    #[prost(uint32, optional, tag = "2")]
+    pub shard_id: ::core::option::Option<u32>,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -3427,8 +3785,8 @@ pub struct CreateFieldIndexCollectionInternal {
     pub create_field_index_collection: ::core::option::Option<
         CreateFieldIndexCollection,
     >,
-    #[prost(uint32, tag = "2")]
-    pub shard_id: u32,
+    #[prost(uint32, optional, tag = "2")]
+    pub shard_id: ::core::option::Option<u32>,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -3437,16 +3795,16 @@ pub struct DeleteFieldIndexCollectionInternal {
     pub delete_field_index_collection: ::core::option::Option<
         DeleteFieldIndexCollection,
     >,
-    #[prost(uint32, tag = "2")]
-    pub shard_id: u32,
+    #[prost(uint32, optional, tag = "2")]
+    pub shard_id: ::core::option::Option<u32>,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct SearchPointsInternal {
     #[prost(message, optional, tag = "1")]
     pub search_points: ::core::option::Option<SearchPoints>,
-    #[prost(uint32, tag = "2")]
-    pub shard_id: u32,
+    #[prost(uint32, optional, tag = "2")]
+    pub shard_id: ::core::option::Option<u32>,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -3455,40 +3813,40 @@ pub struct SearchBatchPointsInternal {
     pub collection_name: ::prost::alloc::string::String,
     #[prost(message, repeated, tag = "2")]
     pub search_points: ::prost::alloc::vec::Vec<SearchPoints>,
-    #[prost(uint32, tag = "3")]
-    pub shard_id: u32,
+    #[prost(uint32, optional, tag = "3")]
+    pub shard_id: ::core::option::Option<u32>,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ScrollPointsInternal {
     #[prost(message, optional, tag = "1")]
     pub scroll_points: ::core::option::Option<ScrollPoints>,
-    #[prost(uint32, tag = "2")]
-    pub shard_id: u32,
+    #[prost(uint32, optional, tag = "2")]
+    pub shard_id: ::core::option::Option<u32>,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct RecommendPointsInternal {
     #[prost(message, optional, tag = "1")]
     pub recommend_points: ::core::option::Option<RecommendPoints>,
-    #[prost(uint32, tag = "2")]
-    pub shard_id: u32,
+    #[prost(uint32, optional, tag = "2")]
+    pub shard_id: ::core::option::Option<u32>,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct GetPointsInternal {
     #[prost(message, optional, tag = "1")]
     pub get_points: ::core::option::Option<GetPoints>,
-    #[prost(uint32, tag = "2")]
-    pub shard_id: u32,
+    #[prost(uint32, optional, tag = "2")]
+    pub shard_id: ::core::option::Option<u32>,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct CountPointsInternal {
     #[prost(message, optional, tag = "1")]
     pub count_points: ::core::option::Option<CountPoints>,
-    #[prost(uint32, tag = "2")]
-    pub shard_id: u32,
+    #[prost(uint32, optional, tag = "2")]
+    pub shard_id: ::core::option::Option<u32>,
 }
 /// Generated client implementations.
 pub mod points_internal_client {
@@ -5089,6 +5447,13 @@ pub struct CreateFullSnapshotRequest {}
 pub struct ListFullSnapshotsRequest {}
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
+pub struct DeleteFullSnapshotRequest {
+    /// Name of the full snapshot
+    #[prost(string, tag = "1")]
+    pub snapshot_name: ::prost::alloc::string::String,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct CreateSnapshotRequest {
     /// Name of the collection
     #[prost(string, tag = "1")]
@@ -5100,6 +5465,16 @@ pub struct ListSnapshotsRequest {
     /// Name of the collection
     #[prost(string, tag = "1")]
     pub collection_name: ::prost::alloc::string::String,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct DeleteSnapshotRequest {
+    /// Name of the collection
+    #[prost(string, tag = "1")]
+    pub collection_name: ::prost::alloc::string::String,
+    /// Name of the collection snapshot
+    #[prost(string, tag = "2")]
+    pub snapshot_name: ::prost::alloc::string::String,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -5130,6 +5505,13 @@ pub struct ListSnapshotsResponse {
     pub snapshot_descriptions: ::prost::alloc::vec::Vec<SnapshotDescription>,
     /// Time spent to process
     #[prost(double, tag = "2")]
+    pub time: f64,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct DeleteSnapshotResponse {
+    /// Time spent to process
+    #[prost(double, tag = "1")]
     pub time: f64,
 }
 /// Generated client implementations.
@@ -5240,6 +5622,25 @@ pub mod snapshots_client {
             self.inner.unary(request.into_request(), path, codec).await
         }
         ///
+        /// Delete collection snapshots
+        pub async fn delete(
+            &mut self,
+            request: impl tonic::IntoRequest<super::DeleteSnapshotRequest>,
+        ) -> Result<tonic::Response<super::DeleteSnapshotResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::new(
+                        tonic::Code::Unknown,
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static("/qdrant.Snapshots/Delete");
+            self.inner.unary(request.into_request(), path, codec).await
+        }
+        ///
         /// Create full storage snapshot
         pub async fn create_full(
             &mut self,
@@ -5281,6 +5682,27 @@ pub mod snapshots_client {
             );
             self.inner.unary(request.into_request(), path, codec).await
         }
+        ///
+        /// List full storage snapshots
+        pub async fn delete_full(
+            &mut self,
+            request: impl tonic::IntoRequest<super::DeleteFullSnapshotRequest>,
+        ) -> Result<tonic::Response<super::DeleteSnapshotResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::new(
+                        tonic::Code::Unknown,
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/qdrant.Snapshots/DeleteFull",
+            );
+            self.inner.unary(request.into_request(), path, codec).await
+        }
     }
 }
 /// Generated server implementations.
@@ -5303,6 +5725,12 @@ pub mod snapshots_server {
             request: tonic::Request<super::ListSnapshotsRequest>,
         ) -> Result<tonic::Response<super::ListSnapshotsResponse>, tonic::Status>;
         ///
+        /// Delete collection snapshots
+        async fn delete(
+            &self,
+            request: tonic::Request<super::DeleteSnapshotRequest>,
+        ) -> Result<tonic::Response<super::DeleteSnapshotResponse>, tonic::Status>;
+        ///
         /// Create full storage snapshot
         async fn create_full(
             &self,
@@ -5314,6 +5742,12 @@ pub mod snapshots_server {
             &self,
             request: tonic::Request<super::ListFullSnapshotsRequest>,
         ) -> Result<tonic::Response<super::ListSnapshotsResponse>, tonic::Status>;
+        ///
+        /// List full storage snapshots
+        async fn delete_full(
+            &self,
+            request: tonic::Request<super::DeleteFullSnapshotRequest>,
+        ) -> Result<tonic::Response<super::DeleteSnapshotResponse>, tonic::Status>;
     }
     #[derive(Debug)]
     pub struct SnapshotsServer<T: Snapshots> {
@@ -5450,6 +5884,44 @@ pub mod snapshots_server {
                     };
                     Box::pin(fut)
                 }
+                "/qdrant.Snapshots/Delete" => {
+                    #[allow(non_camel_case_types)]
+                    struct DeleteSvc<T: Snapshots>(pub Arc<T>);
+                    impl<
+                        T: Snapshots,
+                    > tonic::server::UnaryService<super::DeleteSnapshotRequest>
+                    for DeleteSvc<T> {
+                        type Response = super::DeleteSnapshotResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::DeleteSnapshotRequest>,
+                        ) -> Self::Future {
+                            let inner = self.0.clone();
+                            let fut = async move { (*inner).delete(request).await };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let inner = inner.0;
+                        let method = DeleteSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
                 "/qdrant.Snapshots/CreateFull" => {
                     #[allow(non_camel_case_types)]
                     struct CreateFullSvc<T: Snapshots>(pub Arc<T>);
@@ -5515,6 +5987,44 @@ pub mod snapshots_server {
                     let fut = async move {
                         let inner = inner.0;
                         let method = ListFullSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/qdrant.Snapshots/DeleteFull" => {
+                    #[allow(non_camel_case_types)]
+                    struct DeleteFullSvc<T: Snapshots>(pub Arc<T>);
+                    impl<
+                        T: Snapshots,
+                    > tonic::server::UnaryService<super::DeleteFullSnapshotRequest>
+                    for DeleteFullSvc<T> {
+                        type Response = super::DeleteSnapshotResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::DeleteFullSnapshotRequest>,
+                        ) -> Self::Future {
+                            let inner = self.0.clone();
+                            let fut = async move { (*inner).delete_full(request).await };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let inner = inner.0;
+                        let method = DeleteFullSvc(inner);
                         let codec = tonic::codec::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

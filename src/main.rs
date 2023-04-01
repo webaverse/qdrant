@@ -2,7 +2,7 @@
 
 #[cfg(feature = "web")]
 mod actix;
-pub mod common;
+mod common;
 mod consensus;
 mod greeting;
 mod migrations;
@@ -32,8 +32,11 @@ use storage::dispatcher::Dispatcher;
 #[cfg(not(target_env = "msvc"))]
 use tikv_jemallocator::Jemalloc;
 
-use crate::common::helpers::create_search_runtime;
+use crate::common::helpers::{
+    create_general_purpose_runtime, create_search_runtime, create_update_runtime,
+};
 use crate::common::telemetry::TelemetryCollector;
+use crate::common::telemetry_reporting::TelemetryReporter;
 use crate::greeting::welcome;
 use crate::migrations::single_to_cluster::handle_existing_collections;
 use crate::settings::Settings;
@@ -93,22 +96,42 @@ struct Args {
     /// Default path : config/config.yaml
     #[arg(long, value_name = "PATH")]
     config_path: Option<String>,
+
+    /// Disable telemetry sending to developers
+    /// If provided - telemetry collection will be disabled.
+    /// Read more: https://qdrant.tech/documentation/telemetry
+    #[arg(long, action, default_value_t = false)]
+    disable_telemetry: bool,
 }
 
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     let settings = Settings::new(args.config_path).expect("Can't read config.");
 
+    let reporting_enabled = !settings.telemetry_disabled && !args.disable_telemetry;
+
+    let reporting_id = TelemetryCollector::generate_id();
+
     setup_logger(&settings.log_level);
-    setup_panic_hook();
+    setup_panic_hook(reporting_enabled, reporting_id.to_string());
 
     segment::madvise::set_global(settings.storage.mmap_advice);
+
+    welcome();
+
+    // Saved state of the consensus.
+    let persistent_consensus_state =
+        Persistent::load_or_init(&settings.storage.storage_path, args.bootstrap.is_none())?;
+
+    let is_distributed_deployment = settings.cluster.enabled;
 
     let restored_collections = if let Some(full_snapshot) = args.storage_snapshot {
         recover_full_snapshot(
             &full_snapshot,
             &settings.storage.storage_path,
             args.force_snapshot,
+            persistent_consensus_state.this_peer_id(),
+            is_distributed_deployment,
         )
     } else if let Some(snapshots) = args.snapshot {
         // recover from snapshots
@@ -116,18 +139,25 @@ fn main() -> anyhow::Result<()> {
             &snapshots,
             args.force_snapshot,
             &settings.storage.storage_path,
+            persistent_consensus_state.this_peer_id(),
+            is_distributed_deployment,
         )
     } else {
         vec![]
     };
 
-    welcome();
-
     // Create and own search runtime out of the scope of async context to ensure correct
     // destruction of it
-    let runtime = create_search_runtime(settings.storage.performance.max_search_threads)
-        .expect("Can't create runtime.");
-    let runtime_handle = runtime.handle().clone();
+    let search_runtime = create_search_runtime(settings.storage.performance.max_search_threads)
+        .expect("Can't search create runtime.");
+
+    let update_runtime =
+        create_update_runtime(settings.storage.performance.max_optimization_threads)
+            .expect("Can't optimizer create runtime.");
+
+    let general_runtime =
+        create_general_purpose_runtime().expect("Can't optimizer general purpose runtime.");
+    let runtime_handle = general_runtime.handle().clone();
 
     // Create a signal sender and receiver. It is used to communicate with the consensus thread.
     let (propose_sender, propose_receiver) = std::sync::mpsc::channel();
@@ -139,10 +169,6 @@ fn main() -> anyhow::Result<()> {
         // We don't need sender for the single-node mode
         None
     };
-
-    // Saved state of the consensus.
-    let persistent_consensus_state =
-        Persistent::load_or_init(&settings.storage.storage_path, args.bootstrap.is_none())?;
 
     // Channel service is used to manage connections between peers.
     // It allocates required number of channels and manages proper reconnection handling
@@ -165,7 +191,9 @@ fn main() -> anyhow::Result<()> {
     // It is a main entry point for the storage.
     let toc = TableOfContent::new(
         &settings.storage,
-        runtime,
+        search_runtime,
+        update_runtime,
+        general_runtime,
         channel_service.clone(),
         persistent_consensus_state.this_peer_id(),
         propose_operation_sender.clone(),
@@ -203,7 +231,8 @@ fn main() -> anyhow::Result<()> {
         let dispatcher_arc = Arc::new(dispatcher);
 
         // Monitoring and telemetry.
-        let telemetry_collector = TelemetryCollector::new(settings.clone(), dispatcher_arc.clone());
+        let telemetry_collector =
+            TelemetryCollector::new(settings.clone(), dispatcher_arc.clone(), reporting_id);
         let tonic_telemetry_collector = telemetry_collector.tonic_telemetry_collector.clone();
 
         // `raft` crate uses `slog` crate so it is needed to use `slog_stdlog::StdLog` to forward
@@ -226,6 +255,7 @@ fn main() -> anyhow::Result<()> {
             propose_receiver,
             tonic_telemetry_collector,
             toc_arc.clone(),
+            runtime_handle.clone(),
         )
         .expect("Can't initialize consensus");
 
@@ -271,16 +301,35 @@ fn main() -> anyhow::Result<()> {
         let dispatcher_arc = Arc::new(dispatcher);
 
         // Monitoring and telemetry.
-        let telemetry_collector = TelemetryCollector::new(settings.clone(), dispatcher_arc.clone());
+        let telemetry_collector =
+            TelemetryCollector::new(settings.clone(), dispatcher_arc.clone(), reporting_id);
         (telemetry_collector, dispatcher_arc)
     };
 
     let tonic_telemetry_collector = telemetry_collector.tonic_telemetry_collector.clone();
 
+    //
+    // Telemetry reporting
+    //
+
+    let reporting_id = telemetry_collector.reporting_id();
+    let telemetry_collector = Arc::new(tokio::sync::Mutex::new(telemetry_collector));
+
+    if reporting_enabled {
+        log::info!("Telemetry reporting enabled, id: {}", reporting_id);
+
+        runtime_handle.spawn(TelemetryReporter::run(telemetry_collector.clone()));
+    } else {
+        log::info!("Telemetry reporting disabled");
+    }
+
+    //
+    // REST API server
+    //
+
     #[cfg(feature = "web")]
     {
         let dispatcher_arc = dispatcher_arc.clone();
-        let telemetry_collector = Arc::new(tokio::sync::Mutex::new(telemetry_collector));
         let settings = settings.clone();
         let handle = thread::Builder::new()
             .name("web".to_string())
@@ -288,6 +337,10 @@ fn main() -> anyhow::Result<()> {
             .unwrap();
         handles.push(handle);
     }
+
+    //
+    // gRPC server
+    //
 
     if let Some(grpc_port) = settings.service.grpc_port {
         let settings = settings.clone();
@@ -299,6 +352,7 @@ fn main() -> anyhow::Result<()> {
                     tonic_telemetry_collector,
                     settings.service.host,
                     grpc_port,
+                    runtime_handle,
                 )
             })
             .unwrap();
@@ -326,7 +380,7 @@ fn main() -> anyhow::Result<()> {
 
                 let mut error = format!("{} deadlocks detected\n", deadlocks.len());
                 for (i, threads) in deadlocks.iter().enumerate() {
-                    writeln!(error, "Deadlock #{}", i).expect("fail to writeln!");
+                    writeln!(error, "Deadlock #{i}").expect("fail to writeln!");
                     for t in threads {
                         writeln!(
                             error,
@@ -343,6 +397,10 @@ fn main() -> anyhow::Result<()> {
     }
 
     for handle in handles.into_iter() {
+        log::debug!(
+            "Waiting for thread {} to finish",
+            handle.thread().name().unwrap()
+        );
         handle.join().expect("thread is not panicking")?;
     }
     drop(toc_arc);

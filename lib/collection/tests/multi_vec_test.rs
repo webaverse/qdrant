@@ -6,7 +6,9 @@ use std::path::Path;
 
 use collection::collection::Collection;
 use collection::config::{CollectionConfig, CollectionParams, WalConfig};
-use collection::operations::point_ops::{PointInsertOperations, PointOperations, PointStruct};
+use collection::operations::point_ops::{
+    PointInsertOperations, PointOperations, PointStruct, WriteOrdering,
+};
 use collection::operations::types::{
     CollectionError, PointRequest, RecommendRequest, SearchRequest, VectorParams, VectorsConfig,
 };
@@ -16,7 +18,6 @@ use segment::data_types::named_vectors::NamedVectors;
 use segment::data_types::vectors::{NamedVector, VectorStruct};
 use segment::types::{Distance, WithPayloadInterface, WithVector};
 use tempfile::Builder;
-use tokio::runtime::Handle;
 
 use crate::common::{new_local_collection, N_SHARDS, TEST_OPTIMIZERS_CONFIG};
 
@@ -65,6 +66,7 @@ pub async fn multi_vec_collection_fixture(collection_path: &Path, shard_number: 
         optimizer_config: TEST_OPTIMIZERS_CONFIG.clone(),
         wal_config,
         hnsw_config: Default::default(),
+        quantization_config: Default::default(),
     };
 
     let snapshot_path = collection_path.join("snapshots");
@@ -105,7 +107,7 @@ async fn test_multi_vec_with_shards(shard_number: u32) {
         PointInsertOperations::PointsList(points),
     ));
     collection
-        .update_from_client(insert_points, true)
+        .update_from_client(insert_points, true, WriteOrdering::default())
         .await
         .unwrap();
 
@@ -127,7 +129,7 @@ async fn test_multi_vec_with_shards(shard_number: u32) {
     };
 
     let result = collection
-        .search(full_search_request, &Handle::current(), None)
+        .search(full_search_request, None, None)
         .await
         .unwrap();
 
@@ -154,14 +156,11 @@ async fn test_multi_vec_with_shards(shard_number: u32) {
         score_threshold: None,
     };
 
-    let result = collection
-        .search(failed_search_request, &Handle::current(), None)
-        .await;
+    let result = collection.search(failed_search_request, None, None).await;
 
     assert!(
         matches!(result, Err(CollectionError::BadInput { .. })),
-        "{:?}",
-        result
+        "{result:?}"
     );
 
     let full_search_request = SearchRequest {
@@ -180,7 +179,7 @@ async fn test_multi_vec_with_shards(shard_number: u32) {
     };
 
     let result = collection
-        .search(full_search_request, &Handle::current(), None)
+        .search(full_search_request, None, None)
         .await
         .unwrap();
 
@@ -201,6 +200,7 @@ async fn test_multi_vec_with_shards(shard_number: u32) {
                 with_payload: Some(WithPayloadInterface::Bool(false)),
                 with_vector: WithVector::Selector(vec![VEC_NAME1.to_string()]),
             },
+            None,
             None,
         )
         .await
@@ -223,9 +223,9 @@ async fn test_multi_vec_with_shards(shard_number: u32) {
             limit: 10,
             ..Default::default()
         },
-        &Handle::current(),
         &collection,
         |_name| async { unreachable!("should not be called in this test") },
+        None,
     )
     .await;
 
@@ -234,7 +234,7 @@ async fn test_multi_vec_with_shards(shard_number: u32) {
         Err(err) => match err {
             CollectionError::BadRequest { .. } => {}
             CollectionError::BadInput { .. } => {}
-            error => panic!("Unexpected error {}", error),
+            error => panic!("Unexpected error {error}"),
         },
     }
 
@@ -247,9 +247,9 @@ async fn test_multi_vec_with_shards(shard_number: u32) {
             using: Some(VEC_NAME1.to_string().into()),
             ..Default::default()
         },
-        &Handle::current(),
         &collection,
         |_name| async { unreachable!("should not be called in this test") },
+        None,
     )
     .await
     .unwrap();

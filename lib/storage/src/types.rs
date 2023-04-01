@@ -2,20 +2,28 @@ use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
 use collection::config::WalConfig;
+use collection::operations::shared_storage_config::SharedStorageConfig;
+use collection::operations::types::NodeType;
 use collection::optimizers_builder::OptimizersConfig;
 use collection::shards::shard::PeerId;
 use schemars::JsonSchema;
 use segment::common::anonymize::Anonymize;
 use segment::madvise;
-use segment::types::HnswConfig;
+use segment::types::{HnswConfig, QuantizationConfig};
 use serde::{Deserialize, Serialize};
 use tonic::transport::Uri;
 
 pub type PeerAddressById = HashMap<PeerId, Uri>;
 
-#[derive(Debug, Deserialize, Serialize, JsonSchema, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct PerformanceConfig {
     pub max_search_threads: usize,
+    #[serde(default = "default_max_optimization_threads")]
+    pub max_optimization_threads: usize,
+}
+
+fn default_max_optimization_threads() -> usize {
+    1
 }
 
 /// Global configuration of the storage, loaded on the service launch, default stored in ./config
@@ -30,8 +38,19 @@ pub struct StorageConfig {
     pub wal: WalConfig,
     pub performance: PerformanceConfig,
     pub hnsw_index: HnswConfig,
+    pub quantization: Option<QuantizationConfig>,
     #[serde(default = "default_mmap_advice")]
     pub mmap_advice: madvise::Advice,
+    #[serde(default)]
+    pub node_type: NodeType,
+    #[serde(default)]
+    pub update_queue_size: Option<usize>,
+}
+
+impl StorageConfig {
+    pub fn to_shared_storage_config(&self) -> SharedStorageConfig {
+        SharedStorageConfig::new(self.update_queue_size, self.node_type)
+    }
 }
 
 fn default_snapshots_path() -> String {

@@ -7,10 +7,10 @@ use segment::data_types::vectors::{NamedVector, VectorElementType, DEFAULT_VECTO
 use segment::types::{
     Condition, Filter, HasIdCondition, PointIdType, ScoredPoint, WithPayloadInterface, WithVector,
 };
-use tokio::runtime::Handle;
 use tokio::sync::RwLockReadGuard;
 
 use crate::collection::Collection;
+use crate::operations::consistency_params::ReadConsistency;
 use crate::operations::types::{
     CollectionError, CollectionResult, PointRequest, RecommendRequest, RecommendRequestBatch,
     Record, SearchRequest, SearchRequestBatch, UsingVector,
@@ -41,9 +41,9 @@ fn avg_vectors<'a>(
 
 pub async fn recommend_by<'a, F, Fut>(
     request: RecommendRequest,
-    search_runtime_handle: &Handle,
     collection: &Collection,
     collection_by_name: F,
+    read_consistency: Option<ReadConsistency>,
 ) -> CollectionResult<Vec<ScoredPoint>>
 where
     F: Fn(String) -> Fut,
@@ -58,9 +58,9 @@ where
     };
     let results = recommend_batch_by(
         request_batch,
-        search_runtime_handle,
         collection,
         collection_by_name,
+        read_consistency,
     )
     .await?;
     Ok(results.into_iter().next().unwrap())
@@ -70,6 +70,7 @@ async fn retrieve_points(
     collection: &Collection,
     ids: Vec<PointIdType>,
     vector_names: Vec<String>,
+    read_consistency: Option<ReadConsistency>,
 ) -> CollectionResult<Vec<Record>> {
     collection
         .retrieve(
@@ -78,6 +79,7 @@ async fn retrieve_points(
                 with_payload: Some(WithPayloadInterface::Bool(false)),
                 with_vector: WithVector::Selector(vector_names),
             },
+            read_consistency,
             None,
         )
         .await
@@ -92,12 +94,15 @@ async fn retrieve_points_with_locked_collection(
     collection_holder: CollectionRefHolder<'_>,
     ids: Vec<PointIdType>,
     vector_names: Vec<String>,
+    read_consistency: Option<ReadConsistency>,
 ) -> CollectionResult<Vec<Record>> {
     match collection_holder {
         CollectionRefHolder::Ref(collection) => {
-            retrieve_points(collection, ids, vector_names).await
+            retrieve_points(collection, ids, vector_names, read_consistency).await
         }
-        CollectionRefHolder::Guard(guard) => retrieve_points(&guard, ids, vector_names).await,
+        CollectionRefHolder::Guard(guard) => {
+            retrieve_points(&guard, ids, vector_names, read_consistency).await
+        }
     }
 }
 
@@ -132,9 +137,9 @@ fn get_search_vector_name(request: &RecommendRequest) -> String {
 ///
 pub async fn recommend_batch_by<'a, F, Fut>(
     request_batch: RecommendRequestBatch,
-    search_runtime_handle: &Handle,
     collection: &Collection,
     collection_by_name: F,
+    read_consistency: Option<ReadConsistency>,
 ) -> CollectionResult<Vec<Vec<ScoredPoint>>>
 where
     F: Fn(String) -> Fut,
@@ -188,6 +193,7 @@ where
                 CollectionRefHolder::Ref(collection),
                 points,
                 vector_names,
+                read_consistency,
             )),
             Some(name) => {
                 let other_collection = collection_by_name(name.to_string()).await;
@@ -197,11 +203,12 @@ where
                             CollectionRefHolder::Guard(other_collection),
                             points,
                             vector_names,
+                            read_consistency,
                         ))
                     }
                     None => {
                         return Err(CollectionError::NotFound {
-                            what: format!("Collection {}", name),
+                            what: format!("Collection {name}"),
                         })
                     }
                 }
@@ -302,6 +309,6 @@ where
     let search_batch_request = SearchRequestBatch { searches };
 
     collection
-        .search_batch(search_batch_request, search_runtime_handle, None)
+        .search_batch(search_batch_request, read_consistency, None)
         .await
 }

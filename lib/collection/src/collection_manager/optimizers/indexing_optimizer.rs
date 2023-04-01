@@ -6,7 +6,9 @@ use parking_lot::Mutex;
 use segment::common::operation_time_statistics::{
     OperationDurationStatistics, OperationDurationsAggregator,
 };
-use segment::types::{HnswConfig, Indexes, SegmentType, StorageType, VECTOR_ELEMENT_SIZE};
+use segment::types::{
+    HnswConfig, Indexes, QuantizationConfig, SegmentType, StorageType, VECTOR_ELEMENT_SIZE,
+};
 
 use crate::collection_manager::holders::segment_holder::{
     LockedSegmentHolder, SegmentHolder, SegmentId,
@@ -28,6 +30,7 @@ pub struct IndexingOptimizer {
     collection_temp_dir: PathBuf,
     collection_params: CollectionParams,
     hnsw_config: HnswConfig,
+    quantization_config: Option<QuantizationConfig>,
     telemetry_durations_aggregator: Arc<Mutex<OperationDurationsAggregator>>,
 }
 
@@ -38,6 +41,7 @@ impl IndexingOptimizer {
         collection_temp_dir: PathBuf,
         collection_params: CollectionParams,
         hnsw_config: HnswConfig,
+        quantization_config: Option<QuantizationConfig>,
     ) -> Self {
         IndexingOptimizer {
             thresholds_config,
@@ -45,6 +49,7 @@ impl IndexingOptimizer {
             collection_temp_dir,
             collection_params,
             hnsw_config,
+            quantization_config,
             telemetry_durations_aggregator: OperationDurationsAggregator::new(),
         }
     }
@@ -224,6 +229,10 @@ impl SegmentOptimizer for IndexingOptimizer {
         self.hnsw_config
     }
 
+    fn quantization_config(&self) -> Option<QuantizationConfig> {
+        self.quantization_config.clone()
+    }
+
     fn threshold_config(&self) -> &OptimizerThresholds {
         &self.thresholds_config
     }
@@ -329,6 +338,7 @@ mod tests {
                 on_disk_payload: false,
             },
             Default::default(),
+            Default::default(),
         );
         let locked_holder: Arc<RwLock<_, _>> = Arc::new(RwLock::new(holder));
 
@@ -429,6 +439,7 @@ mod tests {
                 on_disk_payload: false,
             },
             Default::default(),
+            Default::default(),
         );
 
         let locked_holder: Arc<RwLock<_, _>> = Arc::new(RwLock::new(holder));
@@ -480,7 +491,7 @@ mod tests {
         let suggested_to_optimize =
             index_optimizer.check_condition(locked_holder.clone(), &excluded_ids);
         assert!(suggested_to_optimize.contains(&large_segment_id));
-        eprintln!("suggested_to_optimize = {:#?}", suggested_to_optimize);
+        eprintln!("suggested_to_optimize = {suggested_to_optimize:#?}");
         index_optimizer
             .optimize(locked_holder.clone(), suggested_to_optimize, &stopped)
             .unwrap();

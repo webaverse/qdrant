@@ -1,3 +1,4 @@
+use collection::config::CollectionConfig;
 use collection::operations::config_diff::{
     CollectionParamsDiff, HnswConfigDiff, OptimizersConfigDiff, WalConfigDiff,
 };
@@ -7,6 +8,7 @@ use collection::shards::shard::{PeerId, ShardId};
 use collection::shards::transfer::shard_transfer::{ShardTransfer, ShardTransferKey};
 use collection::shards::{replica_set, CollectionId};
 use schemars::JsonSchema;
+use segment::types::QuantizationConfig;
 use serde::{Deserialize, Serialize};
 
 use crate::content_manager::shard_distribution::ShardDistributionProposal;
@@ -88,6 +90,13 @@ impl From<RenameAlias> for AliasOperations {
 /// Operation for creating new collection and (optionally) specify index params
 #[derive(Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq, Hash, Clone)]
 #[serde(rename_all = "snake_case")]
+pub struct InitFrom {
+    pub collection: CollectionId,
+}
+
+/// Operation for creating new collection and (optionally) specify index params
+#[derive(Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq, Hash, Clone)]
+#[serde(rename_all = "snake_case")]
 pub struct CreateCollection {
     /// Vector data config.
     /// It is possible to provide one config for single vector mode and list of configs for multiple vectors mode.
@@ -119,7 +128,15 @@ pub struct CreateCollection {
     /// Custom params for WAL. If none - values from service configuration file are used.
     pub wal_config: Option<WalConfigDiff>,
     /// Custom params for Optimizers.  If none - values from service configuration file are used.
+    #[serde(alias = "optimizer_config")]
     pub optimizers_config: Option<OptimizersConfigDiff>,
+    /// Specify other collection to copy data from.
+    #[serde(default)]
+    pub init_from: Option<InitFrom>,
+    /// Quantization parameters. If none - quantization is disabled.
+    #[serde(default)]
+    #[serde(alias = "quantization")]
+    pub quantization_config: Option<QuantizationConfig>,
 }
 
 /// Operation for creating new collection and (optionally) specify index params
@@ -159,6 +176,7 @@ impl CreateCollectionOperation {
 pub struct UpdateCollection {
     /// Custom params for Optimizers.  If none - values from service configuration file are used.
     /// This operation is blocking, it will only proceed ones all current optimizations are complete
+    #[serde(alias = "optimizer_config")]
     pub optimizers_config: Option<OptimizersConfigDiff>, // ToDo: Allow updates for other configuration params as well
     /// Collection base params.  If none - values from service configuration file are used.
     pub params: Option<CollectionParamsDiff>,
@@ -246,6 +264,13 @@ pub struct SetShardReplicaState {
     pub peer_id: PeerId,
     /// If `Active` then the replica is up to date and can receive updates and answer requests
     pub state: ReplicaState,
+    /// If `Some` then check that the replica is in this state before changing it
+    /// If `None` then the replica can be in any state
+    /// This is useful for example when we want to make sure
+    /// we only make transition from `Initializing` to `Active`, and not from `Dead` to `Active`.
+    /// If `from_state` does not match the current state of the replica, then the operation will be dismissed.
+    #[serde(default)]
+    pub from_state: Option<ReplicaState>,
 }
 
 /// Enumeration of all possible collection update operations
@@ -259,4 +284,23 @@ pub enum CollectionMetaOperations {
     TransferShard(CollectionId, ShardTransferOperations),
     SetShardReplicaState(SetShardReplicaState),
     Nop { token: usize }, // Empty operation
+}
+
+/// Use config of the existing collection to generate a create collection operation
+/// for the new collection
+impl From<CollectionConfig> for CreateCollection {
+    fn from(value: CollectionConfig) -> Self {
+        Self {
+            vectors: value.params.vectors,
+            shard_number: Some(value.params.shard_number.get()),
+            replication_factor: Some(value.params.replication_factor.get()),
+            write_consistency_factor: Some(value.params.write_consistency_factor.get()),
+            on_disk_payload: Some(value.params.on_disk_payload),
+            hnsw_config: Some(value.hnsw_config.into()),
+            wal_config: Some(value.wal_config.into()),
+            optimizers_config: Some(value.optimizer_config.into()),
+            init_from: None,
+            quantization_config: value.quantization_config,
+        }
+    }
 }
