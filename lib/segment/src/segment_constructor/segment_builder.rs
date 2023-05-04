@@ -58,7 +58,7 @@ impl SegmentBuilder {
                 "Segment building error: created segment not found",
             )),
             Some(self_segment) => {
-                self_segment.version = cmp::max(self_segment.version(), other.version());
+                self_segment.version = Some(cmp::max(self_segment.version(), other.version()));
 
                 let other_id_tracker = other.id_tracker.borrow();
                 let other_vector_storages: HashMap<_, _> = other
@@ -127,10 +127,7 @@ impl SegmentBuilder {
                         {
                             external_id
                         } else {
-                            log::warn!(
-                                "Cannot find external id for internal id {}, skipping",
-                                old_internal_id
-                            );
+                            log::warn!("Cannot find external id for internal id {old_internal_id}, skipping");
                             continue;
                         };
                         let other_version =
@@ -213,9 +210,10 @@ impl SegmentBuilder {
     }
 
     fn update_quantization(segment: &Segment, stopped: &AtomicBool) -> OperationResult<()> {
-        if let Some(quantization) = &segment.config().quantization_config {
-            let segment_path = segment.current_path.as_path();
-            for (vector_name, vector_data) in &segment.vector_data {
+        let config = segment.config();
+        for (vector_name, vector_data) in &segment.vector_data {
+            if let Some(quantization) = config.quantization_config(vector_name) {
+                let segment_path = segment.current_path.as_path();
                 check_process_stopped(stopped)?;
 
                 let vector_storage_path = get_vector_storage_path(segment_path, vector_name);

@@ -176,6 +176,8 @@ pub(crate) fn get_merge_optimizer(
             vectors: VectorsConfig::Single(VectorParams {
                 size: NonZeroU64::new(dim as u64).unwrap(),
                 distance: Distance::Dot,
+                hnsw_config: None,
+                quantization_config: None,
             }),
             shard_number: NonZeroU32::new(1).unwrap(),
             on_disk_payload: false,
@@ -204,6 +206,8 @@ pub(crate) fn get_indexing_optimizer(
             vectors: VectorsConfig::Single(VectorParams {
                 size: NonZeroU64::new(dim as u64).unwrap(),
                 distance: Distance::Dot,
+                hnsw_config: None,
+                quantization_config: None,
             }),
             shard_number: NonZeroU32::new(1).unwrap(),
             on_disk_payload: false,

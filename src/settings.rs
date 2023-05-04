@@ -1,12 +1,18 @@
-use std::env;
+use std::{env, io};
 
+use api::grpc::transport_channel_pool::{
+    DEFAULT_CONNECT_TIMEOUT, DEFAULT_GRPC_TIMEOUT, DEFAULT_POOL_SIZE,
+};
+use collection::operations::validation;
 use config::{Config, ConfigError, Environment, File};
 use segment::common::cpu::get_num_cpus;
 use serde::Deserialize;
 use storage::types::StorageConfig;
+use validator::Validate;
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Validate, Clone)]
 pub struct ServiceConfig {
+    #[validate(length(min = 1))]
     pub host: String,
     pub http_port: u16,
     pub grpc_port: Option<u16>, // None means that gRPC is disabled
@@ -14,27 +20,38 @@ pub struct ServiceConfig {
     pub max_workers: Option<usize>,
     #[serde(default = "default_cors")]
     pub enable_cors: bool,
+    #[serde(default)]
+    pub enable_tls: bool,
+    #[serde(default)]
+    pub verify_https_client_certificate: bool,
 }
 
-#[derive(Debug, Deserialize, Clone, Default)]
+#[derive(Debug, Deserialize, Clone, Default, Validate)]
 pub struct ClusterConfig {
     pub enabled: bool, // disabled by default
     #[serde(default = "default_timeout_ms")]
+    #[validate(range(min = 1))]
     pub grpc_timeout_ms: u64,
     #[serde(default = "default_connection_timeout_ms")]
+    #[validate(range(min = 1))]
     pub connection_timeout_ms: u64,
     #[serde(default)]
+    #[validate]
     pub p2p: P2pConfig,
     #[serde(default)]
+    #[validate]
     pub consensus: ConsensusConfig,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, Validate)]
 pub struct P2pConfig {
     #[serde(default)]
     pub port: Option<u16>,
     #[serde(default = "default_connection_pool_size")]
+    #[validate(range(min = 1))]
     pub connection_pool_size: usize,
+    #[serde(default)]
+    pub enable_tls: bool,
 }
 
 impl Default for P2pConfig {
@@ -42,17 +59,20 @@ impl Default for P2pConfig {
         P2pConfig {
             port: None,
             connection_pool_size: default_connection_pool_size(),
+            enable_tls: false,
         }
     }
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, Validate)]
 pub struct ConsensusConfig {
     #[serde(default = "default_max_message_queue_size")]
     pub max_message_queue_size: usize, // controls the back-pressure at the Raft level
     #[serde(default = "default_tick_period_ms")]
+    #[validate(range(min = 1))]
     pub tick_period_ms: u64,
     #[serde(default = "default_bootstrap_timeout_sec")]
+    #[validate(range(min = 1))]
     pub bootstrap_timeout_sec: u64,
 }
 
@@ -67,17 +87,50 @@ impl Default for ConsensusConfig {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+pub struct TlsConfig {
+    pub cert: String,
+    pub key: String,
+    pub ca_cert: String,
+}
+
+#[derive(Debug, Deserialize, Clone, Validate)]
 pub struct Settings {
     #[serde(default = "default_debug")]
     pub debug: bool,
     #[serde(default = "default_log_level")]
     pub log_level: String,
+    #[validate]
     pub storage: StorageConfig,
+    #[validate]
     pub service: ServiceConfig,
     #[serde(default)]
+    #[validate]
     pub cluster: ClusterConfig,
     #[serde(default = "default_telemetry_disabled")]
     pub telemetry_disabled: bool,
+    pub tls: Option<TlsConfig>,
+}
+
+impl Settings {
+    pub fn tls(&self) -> io::Result<&TlsConfig> {
+        self.tls
+            .as_ref()
+            .ok_or_else(Self::tls_config_is_undefined_error)
+    }
+
+    pub fn tls_config_is_undefined_error() -> io::Error {
+        io::Error::new(
+            io::ErrorKind::Other,
+            "TLS config is not defined in the Qdrant config file",
+        )
+    }
+
+    #[allow(dead_code)]
+    pub fn validate_and_warn(&self) {
+        if let Err(ref errs) = self.validate() {
+            validation::warn_validation_errors("Settings configuration file", errs);
+        }
+    }
 }
 
 fn default_telemetry_disabled() -> bool {
@@ -97,11 +150,11 @@ fn default_log_level() -> String {
 }
 
 fn default_timeout_ms() -> u64 {
-    1000 * 60
+    DEFAULT_GRPC_TIMEOUT.as_millis() as u64
 }
 
 fn default_connection_timeout_ms() -> u64 {
-    2000
+    DEFAULT_CONNECT_TIMEOUT.as_millis() as u64
 }
 
 fn default_tick_period_ms() -> u64 {
@@ -118,7 +171,7 @@ fn default_max_message_queue_size() -> usize {
 }
 
 fn default_connection_pool_size() -> usize {
-    2
+    DEFAULT_POOL_SIZE
 }
 
 impl Settings {
@@ -167,9 +220,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_read_default_config() {
+    fn test_default_config() {
         let key = "RUN_MODE";
         env::set_var(key, "TEST");
-        Settings::new(None).unwrap();
+
+        // Read config
+        let config = Settings::new(None).unwrap();
+
+        // Validate
+        config.validate().unwrap();
     }
 }
